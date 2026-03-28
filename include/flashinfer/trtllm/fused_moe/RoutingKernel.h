@@ -17,6 +17,8 @@
 #pragma once
 
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include "IntFastDiv.h"
@@ -168,6 +170,7 @@ namespace routingDeepSeek {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+  tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
   //
   // Grouped Gemm Launch Config Buffers
   //
@@ -192,7 +195,8 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 
   PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
-  OutputT const* mPtrRoutingBias = nullptr;
+  void const* mPtrRoutingBias = nullptr;
+  tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
 
   int32_t mNumExpertGroups = 0;
   int32_t mNumExpertsPerGroup = 0;
@@ -201,12 +205,27 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
   trtllm::dev::IntFastDiv mTopK;
   float mRouteScale = 0.f;
 
+  // Load routing bias value for a given expert, converting to float
+  // regardless of the underlying storage dtype.
+  __device__ __forceinline__ float loadBias(int32_t expertIdx) const {
+    if (mDtypeBias == tg::Dtype::Fp32) {
+      return static_cast<float const*>(mPtrRoutingBias)[expertIdx];
+    } else if (mDtypeBias == tg::Dtype::Bfloat16) {
+      return static_cast<float>(
+          static_cast<__nv_bfloat16 const*>(mPtrRoutingBias)[expertIdx]);
+    } else {  // Fp16
+      return static_cast<float>(
+          static_cast<__half const*>(mPtrRoutingBias)[expertIdx]);
+    }
+  }
+
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
     params.setBaseParams(data);
 
     params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
-    params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+    params.mPtrRoutingBias = data.mPtrRoutingBias;
+    params.mDtypeBias = data.mDtypeBias;
 
     params.mNumExpertGroups = data.mNumExpertGroups;
     params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;

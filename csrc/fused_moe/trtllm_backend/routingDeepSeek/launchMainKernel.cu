@@ -60,7 +60,7 @@ __global__ void routingMainKernel(KernelParams params) {
     expertSelected = laneIdx < params.mNumExpertsPerGroup;
   }
   auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
-  auto biasVal = expertSelected ? params.mPtrRoutingBias[threadExpert] : invalidScore;
+  auto biasVal = expertSelected ? params.loadBias(threadExpert) : invalidScoreFloat;
 
   // initialize the mPtrExpertCounts
   if (params.mPtrExpertCounts) {

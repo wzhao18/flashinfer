@@ -82,6 +82,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeBias;
     routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
