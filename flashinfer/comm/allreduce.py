@@ -469,7 +469,7 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
-    group_size: Optional[int] = None,
+    block_quant_group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -570,6 +570,19 @@ def allreduce_fusion(
         ...     scale_factor=scale_tensor
         ... )
     """
+    # Validate block_quant_group_size for per-token-group FP8 packed quant
+    if block_quant_group_size is not None:
+        _vec_size = 16 // input.element_size()  # bytes_per_access / sizeof(dtype)
+        _group_threads = block_quant_group_size // _vec_size
+        if _group_threads == 0 or (_group_threads & (_group_threads - 1)) != 0:
+            raise ValueError(
+                f"block_quant_group_size / vec_size must be a power of 2 for "
+                f"warp-shuffle reduction. Got block_quant_group_size="
+                f"{block_quant_group_size}, vec_size={_vec_size}, "
+                f"group_threads={_group_threads}. "
+                f"Supported group sizes: 128, 64 (for bf16/fp16)."
+            )
+
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
@@ -633,7 +646,7 @@ def allreduce_fusion(
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
-            group_size=group_size,
+            block_quant_group_size=block_quant_group_size,
         )
 
         # Return the most downstream output (already in 2D shape from input views)

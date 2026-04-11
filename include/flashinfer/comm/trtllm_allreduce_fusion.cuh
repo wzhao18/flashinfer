@@ -724,16 +724,15 @@ enum class AllReduceFusionPattern : int {
   // the result of the norm.
   kARResidualRMSNormOutFP8Quant = 4,
   kARResidualRMSNormOutFP4Quant = 5,
-  // AllReduce + Residual + RMSNorm + per-token-group FP8 quantization with UE8M0 packed scales
-  // (for DeepGEMM). Group scale factors are computed dynamically per group (128 elements).
-  kARResidualRMSNormGroupFP8Quant = 6,
+  // Per-token-group FP8 quantization with UE8M0 packed scales
+  kARResidualRMSNormPerTokenGroupFP8PackedQuant = 6,
 };
 
 enum class QuantType : int {
   kNone = 0,
   kFP8 = 1,
   kFP4 = 2,
-  kGroupFP8 = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
+  kPerTokenGroupFP8Packed = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -763,9 +762,8 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP8Qua
                              true, true, true, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true,
                              true, true, true, QuantType::kFP4);
-// Group FP8: residual + rmsnorm + per-group quant, no norm_out (quant replaces it)
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormGroupFP8Quant, false, true,
-                             true, true, false, QuantType::kGroupFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, false, true,
+                             true, true, false, QuantType::kPerTokenGroupFP8Packed);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -803,8 +801,8 @@ struct AllReduceFusionParams {
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
-  int group_size = 128;    // For kGroupFP8: number of elements per quantization group
-  int tma_aligned_mn = 0;  // For kGroupFP8: TMA-aligned token count for packed scale layout
+  int block_quant_group_size = 128;  // For kPerTokenGroupFP8Packed: elements per quantization group
+  int tma_aligned_mn = 0;  // For kPerTokenGroupFP8Packed: TMA-aligned token count for packed scale layout
 };
 
 template <int NRanks>
@@ -992,13 +990,23 @@ class FusedOp {
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
 #endif
-        if constexpr (GetQuantType<Pattern> == QuantType::kGroupFP8) {
-      // Per-token-group FP8 quantization with UE8M0 packed scales for DeepGEMM.
-      // Each group of (group_size) elements computes its own scale dynamically.
-      // group_size / VEC_SIZE threads collaborate via half-warp shuffles.
+    if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
+            static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+      // Per-token-group FP8 quantization with UE8M0 packed scales.
+      // CONSTRAINT: block_quant_group_size / VEC_SIZE must be a power of 2
+      // (e.g., 128/8=16 or 64/8=8) for the warp-shuffle reduction to stay
+      // within group boundaries.
       constexpr float FP8_E4M3_MAX = 448.0f;
 
-      // Step 1: Compute local max-abs across this thread's VEC_SIZE elements
+      // local max reduce
       float local_absmax = 0.0f;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
@@ -1006,23 +1014,20 @@ class FusedOp {
         local_absmax = fmaxf(local_absmax, v);
       }
 
-      // Step 2: Reduce across threads in the same group via warp shuffles.
-      // group_size_in_vecs = group_size / VEC_SIZE (e.g., 128/8 = 16 for BF16).
-      // These 16 consecutive threads are in the same half-warp, so XOR offsets
-      // 1,2,4,8 stay within the group (groups are 16-thread aligned in the warp).
-      int group_size_in_vecs = m_params.group_size / VEC_SIZE;
+      // group reduce
+      int group_size_in_vecs = m_params.block_quant_group_size / VEC_SIZE;
 #pragma unroll
       for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
         local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
       }
       float group_absmax = local_absmax;
 
-      // Step 3: Compute UE8M0 scale = exp2(ceil(log2(absmax / FP8_MAX)))
+      // compute UE8M0 scale
       float y_s = group_absmax / FP8_E4M3_MAX;
       y_s = exp2f(ceilf(log2f(fmaxf(y_s, 1e-10f))));
       float inv_scale = 1.0f / y_s;
 
-      // Step 4: Quantize elements to FP8
+      // quantize elements to FP8
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
@@ -1033,28 +1038,40 @@ class FusedOp {
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
 
-      // Step 5: Write packed UE8M0 scale. One thread per group writes 1 byte.
+      // Write packed UE8M0 scale + zero padding to match standalone kernel.
       int lane_in_group = m_access_id_in_token % group_size_in_vecs;
       if (lane_in_group == 0) {
         int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
+        int groups_per_row = m_params.hidden_dim / m_params.block_quant_group_size;
+        int k_num_packed = (groups_per_row + 3) / 4;
+        int token_num = m_params.size / m_params.hidden_dim;
         int pack_idx = group_idx_in_row / 4;
         int pos = group_idx_in_row % 4;
-        // Column-major TMA-aligned layout: byte at [pack_idx * tma_aligned_mn * 4 + token_id * 4 +
-        // pos]
         int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
+
+        // Write valid exponent
         unsigned int bits = __float_as_uint(y_s);
         uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
         reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
+
+        // K-padding: last valid group zeros trailing bytes in its pack
+        if (group_idx_in_row == groups_per_row - 1) {
+          for (int p = pos + 1; p < 4; p++) {
+            reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + p] = 0;
+          }
+        }
+
+        // MN-padding: on last valid token, first group zeros all packs
+        // for padding tokens (token_num .. tma_aligned_mn - 1)
+        if (token_id == token_num - 1 && group_idx_in_row == 0) {
+          for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
+            for (int pk = 0; pk < k_num_packed; pk++) {
+              int pad_elem = pk * m_params.tma_aligned_mn + pad_t;
+              reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
+            }
+          }
+        }
       }
-    } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
-      PackedQuantizedType ret;
-#pragma unroll
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-            static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
-      }
-      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else {
       static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
     }
@@ -1625,8 +1642,8 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
         FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");         \
       }                                                                                      \
       break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormGroupFP8Quant:                            \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormGroupFP8Quant, NRanks); \
+    case AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant:                            \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, NRanks); \
       break;                                                                                 \
     default:                                                                                 \
       FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                       \
