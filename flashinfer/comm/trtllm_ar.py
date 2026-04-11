@@ -78,6 +78,9 @@ class AllReduceFusionPattern:
     kARResidualRMSNormOutFP8Quant = 4
     # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
     kARResidualRMSNormOutFP4Quant = 5
+    # All-reduce followed by residual add, RMS norm and per-token-group FP8 quantization
+    # with UE8M0 packed scales (for DeepGEMM)
+    kARResidualRMSNormGroupFP8Quant = 6
 
 
 class QuantizationSFLayout:
@@ -228,6 +231,7 @@ def get_trtllm_comm_module():
             "rms_eps",
             "scale_factor",
             "layout_code",
+            "group_size",
         ],
     )
     def trtllm_allreduce_fusion(
@@ -252,6 +256,7 @@ def get_trtllm_comm_module():
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[QuantizationSFLayout],
+        group_size: Optional[int] = None,
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -275,6 +280,7 @@ def get_trtllm_comm_module():
             rms_eps,
             scale_factor,
             layout_code,
+            group_size,
         )
 
     @register_custom_op(
@@ -929,6 +935,7 @@ def trtllm_allreduce_fusion(
     scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[QuantizationSFLayout],
     metadata: Optional[dict] = None,
+    group_size: Optional[int] = None,
 ) -> None:
     """
     Parameters:
@@ -1012,6 +1019,7 @@ def trtllm_allreduce_fusion(
         rms_eps=rms_eps,
         scale_factor=scale_factor,
         layout_code=layout_code,
+        group_size=group_size,
     )
 
 

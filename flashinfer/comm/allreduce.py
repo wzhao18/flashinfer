@@ -469,6 +469,7 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
+    group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -632,6 +633,7 @@ def allreduce_fusion(
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
+            group_size=group_size,
         )
 
         # Return the most downstream output (already in 2D shape from input views)
