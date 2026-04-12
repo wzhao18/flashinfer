@@ -6,12 +6,12 @@ Pattern: kARResidualRMSNormPerTokenGroupFP8PackedQuant = 6
 Validates the fused kernel against sequential reference:
   NCCL allreduce -> residual add -> RMSNorm -> per-group FP8 quant
 
-Test shapes follow vllm's test_per_token_group_quant_fp8_packed coverage:
+Test shapes cover:
   - MN padding (token_num not multiple of 4)
   - K padding (groups_per_row not multiple of 4)
   - Both MN and K padding
-  - Various group sizes (128, 96)
-  - Poisoned scale buffers (verify padding bytes zeroed)
+  - Various group sizes
+  - Scale buffer always pre-filled with garbage to verify padding zeroed
 """
 
 import multiprocessing as mp
@@ -25,7 +25,129 @@ import torch.distributed as dist
 import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
 
-FP8_DTYPE = torch.float8_e4m3fn
+FP8_E4M3_MAX = 448.0
+
+
+# ---------------------------------------------------------------------------
+# Reference quantization helpers
+# ---------------------------------------------------------------------------
+
+
+def _scale_storage_size(token_num: int, groups_per_row: int) -> int:
+    """Number of int32 elements in the TMA-aligned packed scale storage."""
+    k_num_packed = (groups_per_row + 3) // 4
+    tma_aligned_mn = ((token_num + 3) // 4) * 4
+    return token_num + (k_num_packed - 1) * tma_aligned_mn
+
+
+def _unpack_scales(
+    packed_scales: torch.Tensor, token_num: int, groups_per_row: int
+) -> np.ndarray:
+    """Unpack UE8M0 exponent bytes from TMA-aligned packed int32 layout.
+
+    Returns uint8 array of shape [token_num, groups_per_row].
+    """
+    tma_aligned_mn = ((token_num + 3) // 4) * 4
+    num_elems = _scale_storage_size(token_num, groups_per_row)
+    raw_bytes = (
+        torch.as_strided(packed_scales, (num_elems,), (1,))
+        .cpu()
+        .view(torch.uint8)
+        .numpy()
+    )
+    exponents = np.empty((token_num, groups_per_row), dtype=np.uint8)
+    for t in range(token_num):
+        for g in range(groups_per_row):
+            elem_idx = (g // 4) * tma_aligned_mn + t
+            exponents[t, g] = raw_bytes[elem_idx * 4 + g % 4]
+    return exponents
+
+
+def _pack_scales(
+    exponents: np.ndarray,
+    token_num: int,
+    groups_per_row: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pack UE8M0 exponent bytes into TMA-aligned int32 layout with zero padding."""
+    k_num_packed = (groups_per_row + 3) // 4
+    tma_aligned_mn = ((token_num + 3) // 4) * 4
+    num_elems = _scale_storage_size(token_num, groups_per_row)
+
+    buf = np.zeros(num_elems * 4, dtype=np.uint8)
+    for t in range(token_num):
+        for g in range(groups_per_row):
+            elem_idx = (g // 4) * tma_aligned_mn + t
+            buf[elem_idx * 4 + g % 4] = exponents[t, g]
+
+    flat = torch.from_numpy(buf.view(np.int32).copy()).to(device)
+    out = torch.empty_strided(
+        (token_num, k_num_packed),
+        (1, tma_aligned_mn),
+        device=device,
+        dtype=torch.int32,
+    )
+    torch.as_strided(out, (num_elems,), (1,)).copy_(flat[:num_elems])
+    return out
+
+
+def ref_per_token_group_quant_fp8_packed(
+    x: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference per-token-group FP8 quantization with UE8M0 packed scales.
+
+    Mirrors the fused kernel:
+      1. Per-group absmax
+      2. UE8M0 scale = 2^ceil(log2(max(absmax / 448, 1e-10)))
+      3. Quantize: clamp(x / scale, -448, 448) -> fp8_e4m3
+      4. Pack exponents 4-per-int32 in TMA-aligned column-major layout
+    """
+    token_num, hidden_dim = x.shape
+    groups_per_row = hidden_dim // group_size
+
+    x_grouped = x.float().reshape(token_num, groups_per_row, group_size)
+
+    # Per-group absmax -> UE8M0 power-of-2 scale
+    absmax = x_grouped.abs().amax(dim=-1)
+    y_s = torch.exp2(torch.ceil(torch.log2((absmax / FP8_E4M3_MAX).clamp(min=1e-10))))
+
+    # Quantize to FP8 e4m3 using division (matches kernel)
+    q = (x_grouped / y_s.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    quant_out = q.reshape(token_num, hidden_dim).to(torch.float8_e4m3fn)
+
+    # Extract UE8M0 exponent bytes via numpy reinterpret
+    exponents = ((y_s.cpu().numpy().view(np.uint32) >> 23) & 0xFF).astype(np.uint8)
+
+    return quant_out, _pack_scales(exponents, token_num, groups_per_row, x.device)
+
+
+def ref_quantize_fp8_with_packed_scales(
+    x: torch.Tensor, packed_scales: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """Quantize x to FP8 e4m3 using pre-computed packed UE8M0 scales.
+
+    Isolates the FP8 cast from the scale computation: given the same
+    scale, do fused and reference produce the same FP8 values?
+    """
+    token_num, hidden_dim = x.shape
+    groups_per_row = hidden_dim // group_size
+
+    exponents = _unpack_scales(packed_scales, token_num, groups_per_row)
+    scales = np.where(
+        exponents > 0,
+        np.ldexp(1.0, exponents.astype(np.int32) - 127),
+        0.0,
+    ).astype(np.float32)
+    scales_t = torch.from_numpy(scales).to(x.device)
+
+    x_grouped = x.float().reshape(token_num, groups_per_row, group_size)
+    q = (x_grouped / scales_t.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return q.reshape(token_num, hidden_dim).to(torch.float8_e4m3fn)
+
+
+# ---------------------------------------------------------------------------
+# Multi-process test worker
+# ---------------------------------------------------------------------------
 
 
 def _run_correctness_worker(
@@ -33,8 +155,9 @@ def _run_correctness_worker(
     rank: int,
     dtype: torch.dtype,
     hidden_dim: int,
+    token_num: int,
+    group_size: int,
     distributed_init_port: int,
-    test_cases: list[tuple[int, int, bool]],
     gpu_offset: int = 0,
 ):
     device = torch.device(f"cuda:{rank + gpu_offset}")
@@ -47,188 +170,150 @@ def _run_correctness_worker(
     )
     group = dist.group.WORLD
 
-    max_token_num = max(tc[0] for tc in test_cases)
-
     try:
         workspace = comm.create_allreduce_fusion_workspace(
             backend="trtllm",
             world_size=world_size,
             rank=rank,
-            max_token_num=max_token_num,
+            max_token_num=token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=TorchDistBackend(),
         )
 
-        rms_eps = 1e-5
-        first_error = None
+        groups_per_row = hidden_dim // group_size
+        k_num_packed = (groups_per_row + 3) // 4
+        tma_aligned_mn = ((token_num + 3) // 4) * 4
+        num_scale_elems = _scale_storage_size(token_num, groups_per_row)
 
-        for token_num, group_size, poisoned_scales in test_cases:
-            dist.barrier(group=group)
-            torch.cuda.synchronize()
+        # Input tensors (scaled up to exercise more of the FP8 range)
+        allreduce_in = (
+            torch.randn(token_num, hidden_dim, dtype=dtype, device=device) * 8
+        )
+        allreduce_in_clone = allreduce_in.clone()
+        residual_in = torch.randn(token_num, hidden_dim, dtype=dtype, device=device) * 8
+        residual_in_clone = residual_in.clone()
+        rms_gamma = torch.randn(hidden_dim, dtype=dtype, device=device)
 
-            groups_per_row = hidden_dim // group_size
-            k_num_packed = (groups_per_row + 3) // 4
-            tma_aligned_mn = ((token_num + 3) // 4) * 4
-            num_scale_elems = token_num + (k_num_packed - 1) * tma_aligned_mn
+        # Output tensors
+        residual_out = torch.empty_like(allreduce_in)
+        quant_out = torch.empty(
+            token_num,
+            hidden_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        scale_out = torch.empty_strided(
+            (token_num, k_num_packed),
+            (1, tma_aligned_mn),
+            device=device,
+            dtype=torch.int32,
+        )
 
-            # Input tensors (scaled up to exercise more of the FP8 range)
-            allreduce_in = (
-                torch.randn(token_num, hidden_dim, dtype=dtype, device=device)
-                * 8
-            )
-            allreduce_in_clone = allreduce_in.clone()
-            residual_in = (
-                torch.randn(token_num, hidden_dim, dtype=dtype, device=device)
-                * 8
-            )
-            residual_in_clone = residual_in.clone()
-            rms_gamma = torch.randn(hidden_dim, dtype=dtype, device=device)
+        # Fill with garbage to verify kernel zeroes padding bytes
+        torch.as_strided(scale_out, (num_scale_elems,), (1,)).fill_(0x7F7F7F7F)
 
-            # Output tensors
-            residual_out = torch.empty_like(allreduce_in)
-            quant_out = torch.empty(
-                token_num, hidden_dim,
-                dtype=torch.float8_e4m3fn, device=device,
-            )
-            scale_out = torch.empty_strided(
-                (token_num, k_num_packed),
-                (1, tma_aligned_mn),
-                device=device, dtype=torch.int32,
-            )
+        # Run fused kernel
+        comm.allreduce_fusion(
+            input=allreduce_in,
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+            residual_in=residual_in,
+            residual_out=residual_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            rms_gamma=rms_gamma,
+            rms_eps=1e-5,
+            block_quant_group_size=group_size,
+            fp32_acc=True,
+            use_oneshot=True,
+        )
+        torch.cuda.synchronize()
 
-            if poisoned_scales:
-                # Fill with garbage to verify kernel zeros padding
-                torch.as_strided(
-                    scale_out, (num_scale_elems,), (1,)
-                ).fill_(0x7F7F7F7F)
+        # Reference: allreduce + residual + rmsnorm (no quant)
+        ref_residual_out = torch.empty_like(allreduce_in_clone)
+        ref_norm_out = torch.empty_like(allreduce_in_clone)
+        comm.allreduce_fusion(
+            input=allreduce_in_clone,
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            residual_in=residual_in_clone,
+            residual_out=ref_residual_out,
+            norm_out=ref_norm_out,
+            rms_gamma=rms_gamma,
+            rms_eps=1e-5,
+            fp32_acc=True,
+            use_oneshot=True,
+        )
+        torch.cuda.synchronize()
 
-            # Run fused kernel
-            comm.allreduce_fusion(
-                input=allreduce_in,
-                workspace=workspace,
-                pattern=comm.AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
-                residual_in=residual_in,
-                residual_out=residual_out,
-                quant_out=quant_out,
-                scale_out=scale_out,
-                rms_gamma=rms_gamma,
-                rms_eps=rms_eps,
-                block_quant_group_size=group_size,
-                fp32_acc=True,
-                use_oneshot=True,
-            )
-            torch.cuda.synchronize()
+        # --- Verify ---
 
-            # --- Sequential reference using flashinfer's own AR+RMSNorm ---
-            # Use kARResidualRMSNorm (same allreduce + residual + rmsnorm
-            # code path, same fp32_acc) so the only difference is the quant.
-            ref_residual_out = torch.empty_like(allreduce_in_clone)
-            ref_norm_out = torch.empty_like(allreduce_in_clone)
-            comm.allreduce_fusion(
-                input=allreduce_in_clone,
-                workspace=workspace,
-                pattern=comm.AllReduceFusionPattern.kARResidualRMSNorm,
-                residual_in=residual_in_clone,
-                residual_out=ref_residual_out,
-                norm_out=ref_norm_out,
-                rms_gamma=rms_gamma,
-                rms_eps=rms_eps,
-                fp32_acc=True,
-                use_oneshot=True,
-            )
-            torch.cuda.synchronize()
+        # 1. Residual add
+        torch.testing.assert_close(
+            residual_out.float(),
+            ref_residual_out.float(),
+            atol=1e-1,
+            rtol=1e-2,
+        )
 
-            # --- Verify (catch errors to avoid barrier deadlock) ---
-            # NOTE: the fused pattern uses different register pressure than
-            # kARResidualRMSNorm, which can change block configuration and
-            # fp32 reduction order in RMSNorm. So the norm output can differ
-            # slightly. We verify via round-trip dequantization instead of
-            # exact quant match.
-            try:
-                # 1. Residual: both patterns write residual before RMSNorm,
-                #    so the allreduce+residual path is identical.
-                torch.testing.assert_close(
-                    residual_out.float(), ref_residual_out.float(),
-                    atol=1e-1, rtol=1e-2,
-                )
+        # 2. Quantization: apply reference quant to ref_norm_out
+        _, ref_scale = ref_per_token_group_quant_fp8_packed(
+            ref_norm_out,
+            group_size,
+        )
 
-                # 2. Round-trip: dequantize fused (quant_out, scale_out)
-                #    and compare against the reference norm output.
-                #    This verifies the quant+scale pair is internally
-                #    consistent and approximates the correct norm.
-                fused_deq = torch.zeros(
-                    token_num, hidden_dim, dtype=torch.float32,
-                    device=device,
-                )
-                scale_cpu = scale_out.cpu()
-                for t in range(token_num):
-                    for g in range(groups_per_row):
-                        pack_idx = g // 4
-                        pos = g % 4
-                        packed_val = scale_cpu[t, pack_idx].item()
-                        exponent = (packed_val >> (pos * 8)) & 0xFF
-                        # UE8M0 exponent → float scale: 2^(exponent - 127)
-                        scale_val = 2.0 ** (exponent - 127) if exponent > 0 else 0.0
-                        start = g * group_size
-                        end = start + group_size
-                        fused_deq[t, start:end] = (
-                            quant_out[t, start:end].float() * scale_val
-                        )
+        # 2a. Scales: compare exponent bytes. atol=1 because the
+        # fused and reference RMSNorm can differ slightly, which
+        # may shift the group absmax across a UE8M0 power-of-2
+        # boundary, changing the exponent by 1.
+        fused_scale_bytes = (
+            torch.as_strided(scale_out, (num_scale_elems,), (1,))
+            .cpu()
+            .view(torch.uint8)
+        )
+        ref_scale_bytes = (
+            torch.as_strided(ref_scale, (num_scale_elems,), (1,))
+            .cpu()
+            .view(torch.uint8)
+        )
+        torch.testing.assert_close(
+            fused_scale_bytes.to(torch.int16),
+            ref_scale_bytes.to(torch.int16),
+            atol=1,
+            rtol=0,
+        )
 
-                # Compare dequantized fused output vs reference norm.
-                # FP8 e4m3 has ~4 bits of mantissa → relative error ~1/16.
-                # UE8M0 rounding adds up to 2x. Allow generous tolerance.
-                torch.testing.assert_close(
-                    fused_deq,
-                    ref_norm_out.float(),
-                    atol=2.0, rtol=0.15,
-                )
+        # Padding bytes must be exactly zero (ref is zero by
+        # construction; fused buffer was pre-filled with garbage).
+        padding_mask = ref_scale_bytes == 0
+        assert (fused_scale_bytes[padding_mask] == 0).all(), (
+            "Scale padding bytes not zeroed"
+        )
 
-                # 3. Verify packed scale padding is zero
-                actual_storage = torch.as_strided(
-                    scale_out, (num_scale_elems,), (1,)
-                ).cpu()
-                actual_bytes = actual_storage.view(torch.uint8)
-                valid_mask = torch.zeros(
-                    actual_bytes.numel(), dtype=torch.bool
-                )
-                for row in range(token_num):
-                    for g in range(groups_per_row):
-                        pack_col = g // 4
-                        pos = g % 4
-                        idx = pack_col * tma_aligned_mn + row
-                        byte_idx = idx * 4 + pos
-                        if byte_idx < actual_bytes.numel():
-                            valid_mask[byte_idx] = True
-                padding_mask = ~valid_mask
-                if padding_mask.any():
-                    padding_nonzero = (
-                        actual_bytes[padding_mask] != 0
-                    ).sum().item()
-                    assert padding_nonzero == 0, (
-                        f"Padding not zeroed: {padding_nonzero} bytes "
-                        f"at tokens={token_num}, hidden={hidden_dim}, "
-                        f"group={group_size}, poisoned={poisoned_scales}"
-                    )
-
-                if rank == 0:
-                    print(
-                        f"  PASS: tokens={token_num}, hidden={hidden_dim}, "
-                        f"group={group_size}, poisoned={poisoned_scales}"
-                    )
-            except Exception as e:
-                if first_error is None:
-                    first_error = e
-
-        # Raise first error after all test cases (avoids barrier deadlock)
-        if first_error is not None:
-            raise first_error
+        # 2b. FP8 values: re-quantize ref_norm_out with the fused
+        # kernel's scales to isolate the FP8 cast.
+        ref_quant_fused_scale = ref_quantize_fp8_with_packed_scales(
+            ref_norm_out,
+            scale_out,
+            group_size,
+        )
+        torch.testing.assert_close(
+            quant_out.float(),
+            ref_quant_fused_scale.float(),
+            atol=torch.finfo(torch.float8_e4m3fn).tiny,
+            rtol=torch.finfo(torch.float8_e4m3fn).eps,
+        )
 
     finally:
         dist.barrier(group=group)
         workspace.destroy()
         dist.destroy_process_group(group=group)
+
+
+# ---------------------------------------------------------------------------
+# Test infrastructure
+# ---------------------------------------------------------------------------
 
 
 def _get_open_port() -> int:
@@ -241,7 +326,8 @@ def _multi_process_parallel(
     world_size: int,
     dtype: torch.dtype,
     hidden_dim: int,
-    test_cases: list[tuple[int, int, bool]],
+    token_num: int,
+    group_size: int,
     gpu_offset: int = 0,
 ) -> None:
     mp.set_start_method("spawn", force=True)
@@ -250,67 +336,74 @@ def _multi_process_parallel(
     for i in range(world_size):
         proc = mp.Process(
             target=_run_correctness_worker,
-            args=(world_size, i, dtype, hidden_dim, port, test_cases, gpu_offset),
+            args=(
+                world_size,
+                i,
+                dtype,
+                hidden_dim,
+                token_num,
+                group_size,
+                port,
+                gpu_offset,
+            ),
             name=f"Worker-{i}",
         )
         proc.start()
         procs.append(proc)
     for i, proc in enumerate(procs):
         proc.join()
-        assert proc.exitcode == 0, (
-            f"Process {i} failed with exit code {proc.exitcode}"
-        )
-
-
-# Test cases grouped by hidden_dim (workspace is per-hidden_dim).
-# Each entry: (num_tokens, group_size, poisoned_scales)
-# Covers: MN padding, K padding, both, various group sizes, poisoned scales.
-_TEST_CASES_7168 = [
-    # groups_per_row=56 (56%4=0, no K padding)
-    (4, 128, False),    # no padding
-    (1, 128, False),    # MN padding only (tma_aligned_mn=4)
-    (3, 128, False),    # MN padding only (tma_aligned_mn=4)
-    (1, 128, True),     # poisoned, MN padding
-    (64, 128, False),   # larger, no padding
-    (127, 128, True),   # larger, MN padding, poisoned
-]
-
-_TEST_CASES_768 = [
-    # groups_per_row=6 (128)
-    (4, 128, False),    # K padding (6%4=2)
-    (3, 128, True),     # both MN and K padding, poisoned
-    # NOTE: group_size=96 is NOT supported — group_size/VEC_SIZE must be
-    # a power of 2 for the warp-shuffle reduction to work correctly.
-]
-
-_TEST_CASES_640 = [
-    # groups_per_row=5 (128), K padding (5%4=1)
-    (4, 128, False),    # K padding only
-    (3, 128, True),     # both MN and K padding, poisoned
-    (253, 128, False),  # larger, both padding
-]
-
-_TEST_CASES_384 = [
-    # groups_per_row=3 (128), k_num_packed=1
-    (4, 128, False),    # single packed column, no MN padding
-    (1, 128, True),     # both MN and K padding, poisoned
-]
+        assert proc.exitcode == 0, f"Process {i} failed with exit code {proc.exitcode}"
 
 
 @pytest.mark.parametrize(
-    "hidden_dim,test_cases",
+    "hidden_dim,token_num,group_size",
     [
-        (7168, _TEST_CASES_7168),
-        (768, _TEST_CASES_768),
-        (640, _TEST_CASES_640),
-        (384, _TEST_CASES_384),
+        # ===================== group_size=128 =====================
+        # hidden=7168, groups_per_row=56 (56%4=0, no K padding)
+        (7168, 4, 128),  # no padding (mn%4=0, groups%4=0)
+        (7168, 1, 128),  # MN padding only (tma_aligned_mn=4)
+        (7168, 3, 128),  # MN padding only (tma_aligned_mn=4)
+        (7168, 64, 128),  # larger, no padding
+        (7168, 127, 128),  # larger, MN padding
+        (7168, 512, 128),  # large token count (triggers twoshot)
+        # hidden=768, groups_per_row=6 (6%4=2, K padding)
+        (768, 4, 128),  # K padding only
+        (768, 3, 128),  # both MN and K padding
+        (768, 1, 128),  # MN + K padding, single token
+        # hidden=640, groups_per_row=5 (5%4=1, K padding)
+        (640, 4, 128),  # K padding only
+        (640, 3, 128),  # both MN and K padding
+        (640, 253, 128),  # larger, both padding
+        # hidden=384, groups_per_row=3, k_num_packed=1
+        (384, 4, 128),  # single packed column, no MN padding
+        (384, 1, 128),  # both MN and K padding
+        # hidden=256, groups_per_row=2, k_num_packed=1
+        (256, 4, 128),  # 2 groups per row, no padding
+        (256, 1, 128),  # 2 groups, MN padding
+        # ===================== group_size=64 ======================
+        # hidden=7168, groups_per_row=112 (112%4=0, no K padding)
+        (7168, 4, 64),  # no padding
+        (7168, 3, 64),  # MN padding
+        (7168, 512, 64),  # large token count (triggers twoshot)
+        # hidden=640, groups_per_row=10 (10%4=2, K padding)
+        (640, 4, 64),  # K padding only
+        (640, 3, 64),  # both MN and K padding
+        # hidden=384, groups_per_row=6 (6%4=2, K padding)
+        (384, 4, 64),  # K padding only
+        (384, 1, 64),  # both MN and K padding
+        # hidden=192, groups_per_row=3, k_num_packed=1
+        (192, 4, 64),  # single packed column, no MN padding
+        (192, 1, 64),  # both MN and K padding
     ],
-    ids=["hidden_7168", "hidden_768", "hidden_640", "hidden_384"],
 )
-@pytest.mark.parametrize("world_size", [2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_allreduce_rmsnorm_group_fp8_quant(
-    world_size, dtype, hidden_dim, test_cases
+    world_size,
+    dtype,
+    hidden_dim,
+    token_num,
+    group_size,
 ):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
@@ -320,20 +413,9 @@ def test_allreduce_rmsnorm_group_fp8_quant(
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    print(
-        f"\nTesting AR+RMSNorm+GroupFP8PackedQuant: "
-        f"world_size={world_size}, hidden_dim={hidden_dim}, "
-        f"{len(test_cases)} sub-cases"
-    )
-    _multi_process_parallel(world_size, dtype, hidden_dim, test_cases)
-    print("  All checks passed!")
+    _multi_process_parallel(world_size, dtype, hidden_dim, token_num, group_size)
 
 
 if __name__ == "__main__":
-    for hd, cases in [
-        (7168, _TEST_CASES_7168),
-        (768, _TEST_CASES_768),
-        (640, _TEST_CASES_640),
-        (384, _TEST_CASES_384),
-    ]:
-        test_allreduce_rmsnorm_group_fp8_quant(2, torch.bfloat16, hd, cases)
+    for args in test_allreduce_rmsnorm_group_fp8_quant.pytestmark[0].args[1]:
+        test_allreduce_rmsnorm_group_fp8_quant(2, torch.bfloat16, *args)

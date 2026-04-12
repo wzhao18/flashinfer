@@ -762,8 +762,8 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP8Qua
                              true, true, true, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true,
                              true, true, true, QuantType::kFP4);
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, false, true,
-                             true, true, false, QuantType::kPerTokenGroupFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+                             false, true, true, true, false, QuantType::kPerTokenGroupFP8Packed);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -802,7 +802,8 @@ struct AllReduceFusionParams {
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
   int block_quant_group_size = 128;  // For kPerTokenGroupFP8Packed: elements per quantization group
-  int tma_aligned_mn = 0;  // For kPerTokenGroupFP8Packed: TMA-aligned token count for packed scale layout
+  int tma_aligned_mn =
+      0;  // For kPerTokenGroupFP8Packed: TMA-aligned token count for packed scale layout
 };
 
 template <int NRanks>
@@ -990,7 +991,7 @@ class FusedOp {
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
 #endif
-    if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+        if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
@@ -1025,14 +1026,15 @@ class FusedOp {
       // compute UE8M0 scale
       float y_s = group_absmax / FP8_E4M3_MAX;
       y_s = exp2f(ceilf(log2f(fmaxf(y_s, 1e-10f))));
-      float inv_scale = 1.0f / y_s;
 
       // quantize elements to FP8
+      // NOTE: use division (val / y_s) not multiplication by reciprocal (val * (1/y_s))
+      // to match the standalone per_token_group_quant kernel's precision.
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) * inv_scale;
+        float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / y_s;
         q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
       }
@@ -1612,41 +1614,42 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
     }                                                                                              \
   }
 
-#define DISPATCH_PATTERN(T, NRanks)                                                          \
-  switch (params.pattern) {                                                                  \
-    case AllReduceFusionPattern::kAllReduce:                                                 \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kAllReduce, NRanks);                      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNorm:                                         \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);              \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormFP8Quant:                                 \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                 \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
-        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);    \
-      } else {                                                                               \
-        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");    \
-        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");            \
-      }                                                                                      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                              \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);   \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                              \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
-        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks); \
-      } else {                                                                               \
-        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher"); \
-        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");         \
-      }                                                                                      \
-      break;                                                                                 \
-    case AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant:                            \
-      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, NRanks); \
-      break;                                                                                 \
-    default:                                                                                 \
-      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                       \
+#define DISPATCH_PATTERN(T, NRanks)                                                               \
+  switch (params.pattern) {                                                                       \
+    case AllReduceFusionPattern::kAllReduce:                                                      \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kAllReduce, NRanks);                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNorm:                                              \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                   \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormFP8Quant:                                      \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                      \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                         \
+        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);         \
+      } else {                                                                                    \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");         \
+        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");                 \
+      }                                                                                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                                   \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);        \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                         \
+        DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks);      \
+      } else {                                                                                    \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher");      \
+        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");              \
+      }                                                                                           \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant:                   \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, \
+                        NRanks);                                                                  \
+      break;                                                                                      \
+    default:                                                                                      \
+      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \
   }
 
   switch (params.nranks) {
