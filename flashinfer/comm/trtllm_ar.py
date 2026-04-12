@@ -79,8 +79,10 @@ class AllReduceFusionPattern:
     # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
     kARResidualRMSNormOutFP4Quant = 5
     # All-reduce followed by residual add, RMS norm and per-token-group FP8 quantization
-    # with UE8M0 packed scales (for DeepGEMM)
+    # with UE8M0 packed scales
     kARResidualRMSNormPerTokenGroupFP8PackedQuant = 6
+    # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuantm, with norm output
+    kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 7
 
 
 class QuantizationSFLayout:

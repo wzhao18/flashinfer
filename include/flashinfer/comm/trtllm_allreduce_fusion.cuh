@@ -726,6 +726,8 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNormOutFP4Quant = 5,
   // Per-token-group FP8 quantization with UE8M0 packed scales
   kARResidualRMSNormPerTokenGroupFP8PackedQuant = 6,
+  // Same as above but also outputs the norm result
+  kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 7,
 };
 
 enum class QuantType : int {
@@ -764,6 +766,9 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Qua
                              true, true, true, QuantType::kFP4);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant,
                              false, true, true, true, false, QuantType::kPerTokenGroupFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, false, true, true,
+    true, true, QuantType::kPerTokenGroupFP8Packed);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -1647,6 +1652,10 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
     case AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant:                   \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant, \
                         NRanks);                                                                  \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant:                \
+      DISPATCH_ACC_TYPE(                                                                          \
+          T, AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, NRanks);   \
       break;                                                                                      \
     default:                                                                                      \
       FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \
