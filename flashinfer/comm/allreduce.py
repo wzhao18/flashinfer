@@ -571,17 +571,10 @@ def allreduce_fusion(
         ... )
     """
     # Validate block_quant_group_size for per-token-group FP8 packed quant
-    if block_quant_group_size is not None:
-        _vec_size = 16 // input.element_size()  # bytes_per_access / sizeof(dtype)
-        _group_threads = block_quant_group_size // _vec_size
-        if _group_threads == 0 or (_group_threads & (_group_threads - 1)) != 0:
-            raise ValueError(
-                f"block_quant_group_size / vec_size must be a power of 2 for "
-                f"warp-shuffle reduction. Got block_quant_group_size="
-                f"{block_quant_group_size}, vec_size={_vec_size}, "
-                f"group_threads={_group_threads}. "
-                f"Supported group sizes: 128, 64 (for bf16/fp16)."
-            )
+    if block_quant_group_size is not None and block_quant_group_size not in (64, 128):
+        raise ValueError(
+            f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
+        )
 
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
