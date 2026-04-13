@@ -1,21 +1,5 @@
 """
 Test for AllReduce + Residual + RMSNorm + Per-Token-Group FP8 Quant fusion.
-
-Pattern: kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 7
-
-Uses the Out variant (writes norm_out) so the reference quantization
-operates on the exact same norm values as the kernel — no RMSNorm
-divergence. Validates:
-  - Scale exponents within ±1 of reference (log2f precision)
-  - Scale padding bytes exactly zero
-  - FP8 values exact match (re-quantized with kernel's own scales)
-
-Test shapes cover:
-  - MN padding (token_num not multiple of 4)
-  - K padding (groups_per_row not multiple of 4)
-  - Both MN and K padding
-  - Various group sizes
-  - Scale buffer always pre-filled with garbage to verify padding zeroed
 """
 
 import multiprocessing as mp
@@ -30,11 +14,6 @@ import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
 
 FP8_E4M3_MAX = 448.0
-
-
-# ---------------------------------------------------------------------------
-# Reference quantization helpers
-# ---------------------------------------------------------------------------
 
 
 def _scale_storage_size(token_num: int, groups_per_row: int) -> int:
@@ -149,11 +128,6 @@ def ref_quantize_fp8_with_packed_scales(
     return q.reshape(token_num, hidden_dim).to(torch.float8_e4m3fn)
 
 
-# ---------------------------------------------------------------------------
-# Multi-process test worker
-# ---------------------------------------------------------------------------
-
-
 def _run_correctness_worker(
     world_size: int,
     rank: int,
@@ -190,14 +164,12 @@ def _run_correctness_worker(
         tma_aligned_mn = ((token_num + 3) // 4) * 4
         num_scale_elems = _scale_storage_size(token_num, groups_per_row)
 
-        # Input tensors (scaled up to exercise more of the FP8 range)
         allreduce_in = (
             torch.randn(token_num, hidden_dim, dtype=dtype, device=device) * 8
         )
         residual_in = torch.randn(token_num, hidden_dim, dtype=dtype, device=device) * 8
         rms_gamma = torch.randn(hidden_dim, dtype=dtype, device=device)
 
-        # Output tensors
         residual_out = torch.empty_like(allreduce_in)
         norm_out = torch.empty_like(allreduce_in)
         quant_out = torch.empty(
@@ -213,10 +185,10 @@ def _run_correctness_worker(
             dtype=torch.int32,
         )
 
-        # Fill with garbage to verify kernel zeroes padding bytes
+        # fill with non-zero values to verify kernel zeroes padding bytes
         torch.as_strided(scale_out, (num_scale_elems,), (1,)).fill_(0x7F7F7F7F)
 
-        # Run fused kernel (Out variant: also writes norm_out)
+        # run fused kernel
         comm.allreduce_fusion(
             input=allreduce_in,
             workspace=workspace,
@@ -234,49 +206,26 @@ def _run_correctness_worker(
         )
         torch.cuda.synchronize()
 
-        # --- Verify against reference quantization of norm_out ---
-        # Since norm_out comes from the same kernel invocation,
-        # there is no RMSNorm divergence.
-        _, ref_scale = ref_per_token_group_quant_fp8_packed(
+        # Verify against reference quantization of norm_out
+        ref_quant, ref_scale = ref_per_token_group_quant_fp8_packed(
             norm_out,
             group_size,
         )
 
-        # 1. Scale exponents: allow ±1 due to log2f precision
-        # difference between CUDA kernel and torch.log2.
-        fused_scale_bytes = (
-            torch.as_strided(scale_out, (num_scale_elems,), (1,))
-            .cpu()
-            .view(torch.uint8)
-        )
-        ref_scale_bytes = (
-            torch.as_strided(ref_scale, (num_scale_elems,), (1,))
-            .cpu()
-            .view(torch.uint8)
-        )
-        torch.testing.assert_close(
-            fused_scale_bytes.to(torch.int16),
-            ref_scale_bytes.to(torch.int16),
-            atol=1,
-            rtol=0,
+        # Packed scales must match exactly (bit manipulation avoids
+        # log2f precision issues under --use_fast_math).
+        fused_scale_flat = torch.as_strided(scale_out, (num_scale_elems,), (1,)).cpu()
+        ref_scale_flat = torch.as_strided(ref_scale, (num_scale_elems,), (1,)).cpu()
+        assert torch.equal(fused_scale_flat, ref_scale_flat), (
+            "Packed scale mismatch: "
+            f"{(fused_scale_flat != ref_scale_flat).sum().item()}/{num_scale_elems} differ"
         )
 
-        # 2. Padding bytes must be exactly zero (ref is zero by
-        # construction; fused buffer was pre-filled with garbage).
-        padding_mask = ref_scale_bytes == 0
-        assert (fused_scale_bytes[padding_mask] == 0).all(), (
-            "Scale padding bytes not zeroed"
-        )
-
-        # 3. FP8 values: re-quantize norm_out with the kernel's
-        # own scales. Same input + same scale = exact match.
-        ref_quant = ref_quantize_fp8_with_packed_scales(
-            norm_out,
-            scale_out,
-            group_size,
-        )
-        assert (quant_out.view(torch.uint8) == ref_quant.view(torch.uint8)).all(), (
-            "FP8 quant mismatch"
+        # Quantized activations must match exactly.
+        assert torch.equal(quant_out.view(torch.uint8), ref_quant.view(torch.uint8)), (
+            "FP8 quant mismatch: "
+            f"{(quant_out.view(torch.uint8) != ref_quant.view(torch.uint8)).sum().item()}"
+            f"/{quant_out.numel()} differ"
         )
 
     finally:
@@ -285,16 +234,17 @@ def _run_correctness_worker(
         dist.destroy_process_group(group=group)
 
 
-# ---------------------------------------------------------------------------
-# Test infrastructure
-# ---------------------------------------------------------------------------
-
-
 def _get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+    except OSError:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("::1", 0))
+            return s.getsockname()[1]
 
 
 def _multi_process_parallel(
@@ -374,8 +324,3 @@ def test_allreduce_rmsnorm_group_fp8_quant(
     torch.cuda.manual_seed_all(42)
 
     _multi_process_parallel(world_size, dtype, hidden_dim, token_num, group_size)
-
-
-if __name__ == "__main__":
-    for args in test_allreduce_rmsnorm_group_fp8_quant.pytestmark[0].args[1]:
-        test_allreduce_rmsnorm_group_fp8_quant(2, torch.bfloat16, *args)

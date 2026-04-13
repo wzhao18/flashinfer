@@ -1028,9 +1028,18 @@ class FusedOp {
       }
       float group_absmax = local_absmax;
 
-      // compute UE8M0 scale
-      float y_s = group_absmax / FP8_E4M3_MAX;
-      y_s = exp2f(ceilf(log2f(fmaxf(y_s, 1e-10f))));
+      // Compute UE8M0 scale: round (absmax / 448) up to the next power of 2.
+      // Use bit manipulation instead of exp2f(ceilf(log2f(...))) because
+      // --use_fast_math replaces log2f with __log2f which has ≤2 ULP error
+      // and returns e.g. -5.999999 instead of -6.0 for exact powers of 2,
+      // causing ceilf to round up incorrectly.
+      float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
+      unsigned int y_s_bits = __float_as_uint(y_s);
+      if (y_s_bits & 0x7fffff) {
+        // Not a power of 2: increment exponent, clear mantissa.
+        y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
+      }
+      y_s = __uint_as_float(y_s_bits);
 
       // quantize elements to FP8
       // NOTE: use division (val / y_s) not multiplication by reciprocal (val * (1/y_s))
