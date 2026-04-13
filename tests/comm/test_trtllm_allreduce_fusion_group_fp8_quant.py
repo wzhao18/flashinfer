@@ -3,7 +3,7 @@ Test for AllReduce + Residual + RMSNorm + Per-Token-Group FP8 Quant fusion.
 """
 
 import multiprocessing as mp
-import socket
+import tempfile
 
 import numpy as np
 import pytest
@@ -135,14 +135,14 @@ def _run_correctness_worker(
     hidden_dim: int,
     token_num: int,
     group_size: int,
-    distributed_init_port: int,
+    store_path: str,
     gpu_offset: int = 0,
 ):
     device = torch.device(f"cuda:{rank + gpu_offset}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://localhost:{distributed_init_port}",
+        init_method=f"file://{store_path}",
         rank=rank,
         world_size=world_size,
     )
@@ -234,19 +234,6 @@ def _run_correctness_worker(
         dist.destroy_process_group(group=group)
 
 
-def _get_open_port() -> int:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-    except OSError:
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("::1", 0))
-            return s.getsockname()[1]
-
-
 def _multi_process_parallel(
     world_size: int,
     dtype: torch.dtype,
@@ -256,7 +243,10 @@ def _multi_process_parallel(
     gpu_offset: int = 0,
 ) -> None:
     mp.set_start_method("spawn", force=True)
-    port = _get_open_port()
+    # Use a file-based store to avoid TCP port race conditions (EADDRINUSE).
+    # The file must not exist when FileStore initializes, so we create a
+    # temp path and delete it before spawning workers.
+    store_file = tempfile.mktemp(prefix="flashinfer_dist_store_")
     procs = []
     for i in range(world_size):
         proc = mp.Process(
@@ -268,7 +258,7 @@ def _multi_process_parallel(
                 hidden_dim,
                 token_num,
                 group_size,
-                port,
+                store_file,
                 gpu_offset,
             ),
             name=f"Worker-{i}",
