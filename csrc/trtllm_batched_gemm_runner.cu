@@ -121,6 +121,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Skip cubins with clusterZ >= 2 (equivalently mNumSlicesForSplitK >= 2):
+        // these hit a known DSMEM split-K reduction race in trtllm-gen
+        // (DsmemSplitK.h::try_wait.parity hardcoded to 0), producing
+        // intermittent NaN/Inf and non-deterministic output. Until the
+        // upstream fix lands, drop them from the autotuner search space.
+        if (options.mClusterDimZ >= 2) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
