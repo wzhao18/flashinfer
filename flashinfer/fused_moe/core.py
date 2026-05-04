@@ -1061,7 +1061,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
             use_per_token_scaling: bool = False,
-            local_expert_offset: int = 0,
+            num_experts: Optional[int] = None,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -1075,7 +1075,9 @@ def get_trtllm_moe_sm100_module():
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
             self.use_per_token_scaling = use_per_token_scaling
-            self.local_expert_offset = local_expert_offset
+            self.num_experts = (
+                num_experts if num_experts is not None else num_local_experts
+            )
 
         def _make_tuning_config(
             self,
@@ -1090,14 +1092,14 @@ def get_trtllm_moe_sm100_module():
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
-            num_local_experts = self.num_local_experts
-            local_expert_offset = self.local_expert_offset
+            num_experts = self.num_experts
 
             def _init_packed_topk_ids(shapes, dtype, device):
+                # Sample from the *global* expert range to match production:
+                # callers pass identical full-range IDs to every EP rank and
+                # the kernel filters by ``isLocalExpert`` at runtime.
                 expert_ids = torch.randint(
-                    local_expert_offset,
-                    local_expert_offset + num_local_experts,
-                    shapes, dtype=torch.int32, device=device,
+                    0, num_experts, shapes, dtype=torch.int32, device=device
                 )
                 expert_weights = torch.ones(
                     shapes, dtype=torch.bfloat16, device=device
@@ -1528,7 +1530,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
             activation_type=activation_type,
-            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -1702,7 +1704,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             activation_type=activation_type,
-            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -1923,7 +1925,7 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
-            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -2148,7 +2150,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
-            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
         )
         moe_inputs = MoEInputs(
             output=output,
@@ -2355,7 +2357,7 @@ def get_trtllm_moe_sm100_module():
             activation_type=ActivationType.Swiglu,
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
-            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
