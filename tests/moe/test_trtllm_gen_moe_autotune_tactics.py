@@ -340,7 +340,7 @@ def _enumerate_valid_tactics(
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 384])
-@pytest.mark.parametrize("top_k", [6])
+@pytest.mark.parametrize("top_k", [4, 6])
 def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     num_tokens: int,
     hidden_size: int,
