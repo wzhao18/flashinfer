@@ -336,11 +336,11 @@ def _enumerate_valid_tactics(
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("num_tokens", [128])
-@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("num_tokens", [16, 23, 128])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
-@pytest.mark.parametrize("num_experts", [128])
-@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("num_experts", [128, 384])
+@pytest.mark.parametrize("top_k", [6])
 def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     num_tokens: int,
     hidden_size: int,
@@ -688,7 +688,7 @@ def _enumerate_fp8_valid_tactics(
 
 
 @pytest.mark.parametrize("quant_mode", ["DeepSeekFp8", "MxFp8"])
-@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("num_tokens", [16, 23, 128])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128])
