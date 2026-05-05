@@ -1095,9 +1095,6 @@ def get_trtllm_moe_sm100_module():
             num_experts = self.num_experts
 
             def _init_packed_topk_ids(shapes, dtype, device):
-                # Sample from the *global* expert range to match production:
-                # callers pass identical full-range IDs to every EP rank and
-                # the kernel filters by ``isLocalExpert`` at runtime.
                 expert_ids = torch.randint(
                     0, num_experts, shapes, dtype=torch.int32, device=device
                 )

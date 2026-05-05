@@ -81,9 +81,7 @@ def _moe_profile_shapes(
         "topk_ids": _bucket(inputs["packed_topk"]),
         "expert_weights": _bucket(inputs["expert_weights"]),
         "hidden_states": _bucket(inputs["hidden_states"]),
-        "hidden_states_scale": _bucket(
-            inputs["hidden_states_scale"], dim=scale_dim
-        ),
+        "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
         "per_token_scale": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
@@ -155,6 +153,7 @@ def _check_tactic(
 # FP4 routed MoE sweep.
 # ----------------------------------------------------------------------------
 
+
 def _quant_mode_config(quant_mode: Fp4QuantMode):
     if quant_mode == "NvFP4xNvFP4":
         return dict(
@@ -193,8 +192,7 @@ def _build_fp4_routed_moe_inputs(
     routing_method_type: RoutingMethodType,
     device: torch.device,
 ) -> dict:
-    """Build kernel-ready inputs for `trtllm_fp4_block_scale_routed_moe`.
-    """
+    """Build kernel-ready inputs for `trtllm_fp4_block_scale_routed_moe`."""
     cfg = _quant_mode_config(quant_mode)
     sf_vec = cfg["sf_vec_size"]
     use_ue8m0 = cfg["sf_use_ue8m0"]
@@ -232,7 +230,9 @@ def _build_fp4_routed_moe_inputs(
 
     # Weights are always fp4-quantized; the SF flavor (E4M3 vs UE8M0) and
     # the global scale factor differ between nvfp4 and mxfp4.
-    def _quant_weight(t: torch.Tensor, last_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _quant_weight(
+        t: torch.Tensor, last_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q, sf = fp4_quantize(
             t,
             torch.tensor([1.0 / global_sf_w], device=device),
@@ -243,12 +243,16 @@ def _build_fp4_routed_moe_inputs(
         return q, sf
 
     w13_bf16 = (
-        torch.randn(num_experts, intermediate_size * 2, hidden_size, device=device)
-        .to(torch.bfloat16) * 0.1
+        torch.randn(num_experts, intermediate_size * 2, hidden_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
     )
     w2_bf16 = (
-        torch.randn(num_experts, hidden_size, intermediate_size, device=device)
-        .to(torch.bfloat16) * 0.1
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
     )
     w13, w13_scale = _quant_weight(w13_bf16, intermediate_size * 2)
     w2, w2_scale = _quant_weight(w2_bf16, hidden_size)
@@ -311,26 +315,27 @@ def _enumerate_valid_tactics(
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given problem shape."""
     from flashinfer.tllm_enums import Fp8QuantizationType
+
     cfg = _quant_mode_config(quant_mode)
-    return list(moe_op.trtllm_get_valid_moe_configs(
-        cfg["dtype_act"],
-        cfg["dtype_weights"],
-        Fp8QuantizationType.NoneFp8,
-        top_k,
-        hidden_size,
-        intermediate_size,
-        num_experts,                              # num_local_experts
-        ActivationType.Swiglu.value,
-        True,                                     # use_shuffled_weight
-        WeightLayout.MajorK.value,
-        False,                                    # use_per_token_scaling
-        num_tokens,
-    ))
+    return list(
+        moe_op.trtllm_get_valid_moe_configs(
+            cfg["dtype_act"],
+            cfg["dtype_weights"],
+            Fp8QuantizationType.NoneFp8,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            num_experts,  # num_local_experts
+            ActivationType.Swiglu.value,
+            True,  # use_shuffled_weight
+            WeightLayout.MajorK.value,
+            False,  # use_per_token_scaling
+            num_tokens,
+        )
+    )
 
 
-@pytest.mark.parametrize(
-    "quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]
-)
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 @pytest.mark.parametrize("num_tokens", [128])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [3072])
@@ -379,9 +384,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     profile_shapes = _moe_profile_shapes(inputs, num_tokens, bucket_m)
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(
-            profile_shapes, tactic, custom_op=_TEST_OP_FP4
-        )
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
         out = trtllm_fp4_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
             routing_bias=None,
@@ -419,13 +422,19 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     # Heuristic-default tactic acts as reference.
     reference = _run_kernel_with_tactic(None).float()
     ref_max = reference.abs().max().item()
-    assert torch.isfinite(reference).all(), \
+    assert torch.isfinite(reference).all(), (
         f"[{quant_mode}] reference output is not finite — bad test setup"
+    )
 
     moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
     valid_tactics = _enumerate_valid_tactics(
-        moe_op, quant_mode, top_k, hidden_size, intermediate_size,
-        num_experts, num_tokens,
+        moe_op,
+        quant_mode,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
     )
     assert len(valid_tactics) > 0, f"[{quant_mode}] no valid tactics returned"
 
@@ -447,8 +456,13 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     failures: list[str] = []
     t0 = time.time()
     for tactic in valid_tactics:
-        line = _check_tactic(_run_kernel_with_tactic, list(tactic), reference, ref_max,
-                             N_ITERS_PER_TACTIC)
+        line = _check_tactic(
+            _run_kernel_with_tactic,
+            list(tactic),
+            reference,
+            ref_max,
+            N_ITERS_PER_TACTIC,
+        )
         if line is not None:
             failures.append(line)
             print(f"  BAD: {line}", flush=True)
@@ -509,8 +523,7 @@ def _build_fp8_routed_moe_inputs(
 
     if quant_mode == "DeepSeekFp8":
         hidden_states_bf16 = (
-            torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16)
-            * 0.1
+            torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
         )
         hidden_states = hidden_states_bf16.to(torch.float8_e4m3fn)
         hidden_states_scale = torch.ones(
@@ -537,16 +550,22 @@ def _build_fp8_routed_moe_inputs(
             dtype=torch.float32,
         )
     else:  # MxFp8 — full quantize + shuffle pipeline
-        hidden_states_bf16 = torch.randn(
-            num_tokens, hidden_size, device=device
-        ).to(torch.bfloat16)
+        hidden_states_bf16 = torch.randn(num_tokens, hidden_size, device=device).to(
+            torch.bfloat16
+        )
         gemm1_weights_bf16 = torch.randn(
-            num_experts, 2 * intermediate_size, hidden_size,
-            device=device, dtype=torch.bfloat16,
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
         )
         gemm2_weights_bf16 = torch.randn(
-            num_experts, hidden_size, intermediate_size,
-            device=device, dtype=torch.bfloat16,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
         )
         quant_impl = FP8BlockScaleMoe(
             fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
@@ -569,24 +588,32 @@ def _build_fp8_routed_moe_inputs(
             s1 = reorder_rows_for_gated_act_gemm(s1)
             g1_w.append(
                 shuffle_matrix_a(w1.view(torch.uint8), epilogue_tile_m)
-                .contiguous().view(quant_w["gemm1_weights"].dtype)
+                .contiguous()
+                .view(quant_w["gemm1_weights"].dtype)
             )
             g1_s.append(
                 shuffle_matrix_sf_a(
                     s1.view(torch.uint8).reshape(w13_rows, -1), epilogue_tile_m
-                ).contiguous().view(quant_w["gemm1_scales"].dtype)
+                )
+                .contiguous()
+                .view(quant_w["gemm1_scales"].dtype)
             )
             g2_w.append(
                 shuffle_matrix_a(
                     quant_w["gemm2_weights"][i].view(torch.uint8), epilogue_tile_m
-                ).contiguous().view(quant_w["gemm2_weights"].dtype)
+                )
+                .contiguous()
+                .view(quant_w["gemm2_weights"].dtype)
             )
             g2_s.append(
                 shuffle_matrix_sf_a(
                     quant_w["gemm2_scales"][i]
-                    .view(torch.uint8).reshape(hidden_size, -1),
+                    .view(torch.uint8)
+                    .reshape(hidden_size, -1),
                     epilogue_tile_m,
-                ).contiguous().view(quant_w["gemm2_scales"].dtype)
+                )
+                .contiguous()
+                .view(quant_w["gemm2_scales"].dtype)
             )
         gemm1_weights = torch.stack(g1_w)
         gemm1_weights_scale = torch.stack(g1_s)
@@ -643,20 +670,22 @@ def _enumerate_fp8_valid_tactics(
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given FP8 problem shape."""
     cfg = _fp8_quant_mode_config(quant_mode)
-    return list(moe_op.trtllm_get_valid_moe_configs(
-        cfg["dtype_act"],
-        cfg["dtype_weights"],
-        cfg["fp8_quantization_type"],
-        top_k,
-        hidden_size,
-        intermediate_size,
-        num_experts,                               # num_local_experts
-        ActivationType.Swiglu.value,
-        cfg["use_shuffled_weight"],
-        cfg["weight_layout"],
-        False,                                     # use_per_token_scaling
-        num_tokens,
-    ))
+    return list(
+        moe_op.trtllm_get_valid_moe_configs(
+            cfg["dtype_act"],
+            cfg["dtype_weights"],
+            cfg["fp8_quantization_type"],
+            top_k,
+            hidden_size,
+            intermediate_size,
+            num_experts,  # num_local_experts
+            ActivationType.Swiglu.value,
+            cfg["use_shuffled_weight"],
+            cfg["weight_layout"],
+            False,  # use_per_token_scaling
+            num_tokens,
+        )
+    )
 
 
 @pytest.mark.parametrize("quant_mode", ["DeepSeekFp8", "MxFp8"])
@@ -673,8 +702,7 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
     num_experts: int,
     quant_mode: Fp8QuantMode,
 ):
-    """Per-tactic correctness sweep of `trtllm_fp8_block_scale_routed_moe`.
-    """
+    """Per-tactic correctness sweep of `trtllm_fp8_block_scale_routed_moe`."""
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
 
@@ -703,12 +731,8 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
     )
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(
-            profile_shapes, tactic, custom_op=_TEST_OP_FP8
-        )
-        out = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
-        )
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP8)
+        out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
         trtllm_fp8_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
             routing_bias=None,
@@ -741,13 +765,19 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
 
     reference = _run_kernel_with_tactic(None).float()
     ref_max = reference.abs().max().item()
-    assert torch.isfinite(reference).all(), \
+    assert torch.isfinite(reference).all(), (
         f"[{quant_mode}] reference output is not finite — bad test setup"
+    )
 
     moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
     valid_tactics = _enumerate_fp8_valid_tactics(
-        moe_op, quant_mode, top_k, hidden_size, intermediate_size,
-        num_experts, num_tokens,
+        moe_op,
+        quant_mode,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
     )
     assert len(valid_tactics) > 0, f"[{quant_mode}] no valid tactics returned"
 
@@ -769,8 +799,13 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
     failures: list[str] = []
     t0 = time.time()
     for tactic in valid_tactics:
-        line = _check_tactic(_run_kernel_with_tactic, list(tactic), reference, ref_max,
-                             N_ITERS_PER_TACTIC)
+        line = _check_tactic(
+            _run_kernel_with_tactic,
+            list(tactic),
+            reference,
+            ref_max,
+            N_ITERS_PER_TACTIC,
+        )
         if line is not None:
             failures.append(line)
             print(f"  BAD: {line}", flush=True)
