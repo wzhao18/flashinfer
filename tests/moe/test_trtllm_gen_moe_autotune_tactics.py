@@ -367,7 +367,6 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     enable_pdl = device_support_pdl(device)
     routing_method_type = RoutingMethodType.Renormalize
 
-    cfg = _quant_mode_config(quant_mode)
     inputs = _build_fp4_routed_moe_inputs(
         num_tokens=num_tokens,
         hidden_size=hidden_size,

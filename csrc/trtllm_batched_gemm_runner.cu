@@ -121,9 +121,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
-        // Skip cubins with clusterZ >= 2 due to correctness issues described in
+        // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
-        if (options.mClusterDimZ >= 2) continue;
+        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
