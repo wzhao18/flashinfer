@@ -41,6 +41,7 @@ Single-rank smoke (no NVSHMEM)::
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -106,6 +107,9 @@ class MegaMoENvfp4Config:
     ] = "epi_warps"
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
     apply_topk_in_fc1: bool = True
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
 
@@ -150,6 +154,25 @@ class MegaMoENvfp4Config:
                 f"combine_dtype must be 'bf16', 'mxfp8', or 'nvfp4'; "
                 f"got {self.combine_dtype!r}."
             )
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'situ', got {self.activation!r}."
+            )
+        if self.activation == "situ":
+            if self.situ_beta is None:
+                raise ValueError("activation='situ' requires situ_beta.")
+            if not math.isfinite(self.situ_beta) or self.situ_beta <= 0:
+                raise ValueError("situ_beta must be positive and finite.")
+            if self.situ_linear_beta is not None and (
+                not math.isfinite(self.situ_linear_beta) or self.situ_linear_beta <= 0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be positive and finite when set."
+                )
+            if self.gate_up_clamp is not None:
+                raise ValueError("gate_up_clamp is not supported with SiTU.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU parameters require activation='situ'.")
         if self.combine_dtype != "bf16":
             if self.in_kernel_fc2_reduce:
                 raise ValueError(
@@ -440,6 +463,9 @@ class MegaMoENvfp4Frontend:
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
+            c.activation,
+            c.situ_beta,
+            c.situ_linear_beta,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -504,6 +530,15 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        if c.activation == "situ":
+            from .nvfp4_situ import install_situ_metadata
+
+            assert c.situ_beta is not None
+            install_situ_metadata(
+                kernel,
+                situ_beta=c.situ_beta,
+                situ_linear_beta=c.situ_linear_beta,
+            )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -530,7 +565,13 @@ class MegaMoENvfp4Frontend:
         if c.enable_iket:
             compile_kwargs["options"] = "iket"
 
-        mega.compiled = cute.compile(kernel, **compile_kwargs)
+        from .nvfp4_situ import nvfp4_epilogue_compile_context
+
+        with nvfp4_epilogue_compile_context(
+            situ_beta=c.situ_beta if c.activation == "situ" else None,
+            situ_linear_beta=c.situ_linear_beta,
+        ):
+            mega.compiled = cute.compile(kernel, **compile_kwargs)
         self._mega_key = key
         self._mega = mega
         return self._mega
@@ -1005,6 +1046,9 @@ def get_symm_buffer_for_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1021,6 +1065,10 @@ def get_symm_buffer_for_mega_moe(
 
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
+
+    ``activation="situ"`` selects the Kimi SiTU gate and requires
+    ``situ_beta``. ``situ_linear_beta`` optionally bounds the up branch with
+    ``linear_beta * tanh(up / linear_beta)``.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1078,6 +1126,7 @@ def get_symm_buffer_for_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
+            activation=activation,
         )
     if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
@@ -1095,6 +1144,9 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
@@ -1450,6 +1502,9 @@ def create_dummy_inputs(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1498,6 +1553,9 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,

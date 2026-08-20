@@ -75,6 +75,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--gate-up-clamp", type=float, default=None)
     parser.add_argument(
+        "--activation",
+        choices=("swiglu", "situ"),
+        default="swiglu",
+        help="FC1 gated activation (nvfp4 dtype only)",
+    )
+    parser.add_argument("--situ-beta", type=float, default=None)
+    parser.add_argument("--situ-linear-beta", type=float, default=None)
+    parser.add_argument(
         "--allow-nondeterministic",
         action="store_true",
         help="also sweep in_kernel_fc2_reduce candidates",
@@ -130,6 +138,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
+        return 2
+    if args.activation != "swiglu" and args.dtype != "nvfp4":
+        print("--activation is only wired for --dtype nvfp4", file=sys.stderr)
         return 2
 
     if args.dtype == "nvfp4":

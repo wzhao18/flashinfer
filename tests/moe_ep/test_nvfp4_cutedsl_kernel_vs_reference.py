@@ -196,14 +196,17 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    activation="swiglu",
+    situ_beta=None,
+    situ_linear_beta=None,
     term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
     Mirrors the kernel's data path — dequant → fp32 fc1 GEMM → 16-interleaved
-    SwiGLU fold (+clamp) → per-token topk weight folded in BEFORE the fc1-out
-    NVFP4 round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is
-    bounded by NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
+    gated activation → per-token topk weight folded in BEFORE the fc1-out NVFP4
+    round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is bounded by
+    NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
 
     ``term_transform``, when set, is applied to each per-(token, topk) fc2
     output term before the topk sum; the multirank oracle uses it to model the
@@ -235,29 +238,35 @@ def _torch_nvfp4_mega_reference(
         )  # (2I, hidden)
         fc1_out = act_fp32[tokens] @ fc1_w.transpose(0, 1)  # (R, 2I)
 
-        # SwiGLU over the 16-column gate/up interleave used by the NVFP4 kernel.
+        # Gated activation over the kernel's 16-column gate/up interleave.
         m = fc1_out.shape[0]
         n_pairs = fc1_out.shape[1] // (2 * NVFP4_BLOCK)
         reshaped = fc1_out.view(m, n_pairs, 2, NVFP4_BLOCK)
         gate = reshaped[:, :, 0, :]
         up = reshaped[:, :, 1, :]
-        if gate_up_clamp is not None:
-            limit = abs(float(gate_up_clamp))
-            gate = gate.clamp(max=limit)
-            up = up.clamp(min=-limit, max=limit)
-        swiglu = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
+        if activation == "situ":
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        else:
+            if gate_up_clamp is not None:
+                limit = abs(float(gate_up_clamp))
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            gate = gate * torch.sigmoid(gate)
+        activated = (gate * up).reshape(m, intermediate)
 
         # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
         # (post-hoc weighting would NOT match — quant changes the magnitude).
-        swiglu = swiglu * topk_weights[tokens, slots].unsqueeze(-1)
+        activated = activated * topk_weights[tokens, slots].unsqueeze(-1)
 
-        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(swiglu, 1.0)
-        swiglu_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
+        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(activated, 1.0)
+        activated_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
 
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = activated_rt @ fc2_w.transpose(0, 1)
         if term_transform is not None:
             fc2_out = term_transform(fc2_out)
         out[tokens, slots] = fc2_out
@@ -334,18 +343,36 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "hidden,intermediate,num_experts,topk",
+    "hidden,intermediate,num_experts,topk,activation,situ_beta,situ_linear_beta",
     [
-        pytest.param(2048, 1024, 4, 4, id="regular-e4"),
+        pytest.param(2048, 1024, 4, 4, "swiglu", None, None, id="regular-e4"),
+        pytest.param(2048, 1024, 4, 4, "situ", 4.0, 25.0, id="kimi-situ-e4"),
+        pytest.param(
+            3584,
+            3072,
+            56,
+            16,
+            "situ",
+            4.0,
+            25.0,
+            id="kimi-dep16-situ",
+        ),
         # 128-misaligned (hidden % 128 == 64): exercises the ceil-div K-tail
         # and predicated epilogue paths the %64 validation relaxation opened
         # up (gpt-oss-120b geometry class).
-        pytest.param(2880, 2880, 4, 4, id="tail-e4"),
-        pytest.param(2048, 1024, 1, 1, id="singleton-e1"),
+        pytest.param(2880, 2880, 4, 4, "swiglu", None, None, id="tail-e4"),
+        pytest.param(2048, 1024, 1, 1, "swiglu", None, None, id="singleton-e1"),
     ],
 )
 def test_nvfp4_kernel_matches_torch_reference(
-    monkeypatch, hidden, intermediate, num_experts, topk
+    monkeypatch,
+    hidden,
+    intermediate,
+    num_experts,
+    topk,
+    activation,
+    situ_beta,
+    situ_linear_beta,
 ):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
@@ -383,13 +410,14 @@ def test_nvfp4_kernel_matches_torch_reference(
     rank = 0
     world_size = 1
     num_tokens = problem["num_tokens"]
+    gate_up_clamp = problem["gate_up_clamp"] if activation == "swiglu" else None
 
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     transformed_l1, transformed_l2 = preprocess_mega_weights(
         pack,
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
-        gate_up_clamp=problem["gate_up_clamp"],
+        gate_up_clamp=gate_up_clamp,
     )
 
     fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
@@ -404,7 +432,10 @@ def test_nvfp4_kernel_matches_torch_reference(
         2 * problem["intermediate"],
         rank,
         world_size,
-        gate_up_clamp=problem["gate_up_clamp"],
+        gate_up_clamp=gate_up_clamp,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     try:
         stage_mega_moe_inputs(
@@ -428,7 +459,10 @@ def test_nvfp4_kernel_matches_torch_reference(
             fc2_sf=fc2_sf,
             hidden=problem["hidden"],
             intermediate=problem["intermediate"],
-            gate_up_clamp=problem["gate_up_clamp"],
+            gate_up_clamp=gate_up_clamp,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
 
         y_kernel = torch.empty(
@@ -440,7 +474,7 @@ def test_nvfp4_kernel_matches_torch_reference(
             transformed_l2,
             symm_buffer,
             num_tokens=num_tokens,
-            gate_up_clamp=problem["gate_up_clamp"],
+            gate_up_clamp=gate_up_clamp,
         )
         torch.cuda.synchronize()
 
