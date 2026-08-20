@@ -274,6 +274,7 @@ def autotune_nvfp4_mega_moe(
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
                 combine_dtype=cfg.combine_dtype,
+                activation=cfg.activation,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )

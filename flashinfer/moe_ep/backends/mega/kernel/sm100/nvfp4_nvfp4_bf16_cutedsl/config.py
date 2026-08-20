@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -23,6 +24,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: float | None = None
+    situ_linear_beta: float | None = None
     fast_math: bool = True
     apply_topk_in_fc1: bool = True
     # In-flight top-k combine: cross-rank REDG atomic-add collapses the combine
@@ -46,3 +50,24 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+
+    def __post_init__(self) -> None:
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'situ', got {self.activation!r}."
+            )
+        if self.activation == "situ":
+            if self.situ_beta is None:
+                raise ValueError("activation='situ' requires situ_beta.")
+            if not math.isfinite(self.situ_beta) or self.situ_beta <= 0:
+                raise ValueError("situ_beta must be positive and finite.")
+            if self.situ_linear_beta is not None and (
+                not math.isfinite(self.situ_linear_beta) or self.situ_linear_beta <= 0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be positive and finite when set."
+                )
+            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+                raise ValueError("activation clamps are not supported with SiTU.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU parameters require activation='situ'.")

@@ -38,6 +38,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             args.hidden,
             2 * args.intermediate,
             gate_up_clamp=args.gate_up_clamp,
+            activation=args.activation,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
             combine_dtype=args.combine_dtype,
             seed=args.seed,
         )
@@ -64,6 +67,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     topk=args.topk,
                     max_tokens=max_tokens,
                     combine_dtype=args.combine_dtype,
+                    activation=args.activation,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
