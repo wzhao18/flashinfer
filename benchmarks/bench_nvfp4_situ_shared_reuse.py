@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--max-active-clusters", type=int)
+    parser.add_argument("--correctness", action="store_true")
     args = parser.parse_args()
 
     if not 0 < args.tokens <= args.capacity:
@@ -68,6 +69,36 @@ def main() -> None:
             else None
         ),
     )
+    reference_weights = None
+    if args.correctness:
+        from flashinfer.moe_ep import MoEWeightPack
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+
+        gate = torch.randn(
+            args.intermediate,
+            args.hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ) / 64
+        up = torch.randn_like(gate) / 64
+        down = torch.randn(
+            args.hidden,
+            args.intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ) / 64
+        fc1, fc2 = preprocess_mega_weights(
+            MoEWeightPack(
+                w13=torch.cat((gate, up), dim=0).unsqueeze(0),
+                w2=down.unsqueeze(0),
+            ),
+            intermediate_size=args.intermediate,
+            hidden_size=args.hidden,
+        )
+        reference_weights = gate, up, down
+
     symm.topk_idx.fill_(-1)
     symm.topk_idx[: args.tokens].zero_()
     symm.topk_weights.zero_()
@@ -97,6 +128,26 @@ def main() -> None:
     def end_to_end() -> None:
         stage()
         launch()
+
+    if reference_weights is not None:
+        stage()
+        launch()
+        actual = symm.output_activation[: args.tokens].clone()
+        gate, up, down = reference_weights
+        gate_output = hidden @ gate.t()
+        up_output = hidden @ up.t()
+        gate_output = 4.0 * torch.tanh(gate_output / 4.0) * torch.sigmoid(
+            gate_output
+        )
+        up_output = 25.0 * torch.tanh(up_output / 25.0)
+        expected = (gate_output * up_output).to(torch.bfloat16) @ down.t()
+        relative_l2 = (
+            (actual.float() - expected.float()).norm() / expected.float().norm()
+        ).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        print(f"correctness: relative_l2={relative_l2:.6f} cosine={cosine:.8f}")
 
     kernel_times = event_times(launch, args.warmup, args.iterations)
     stage_times = event_times(stage, args.warmup, args.iterations)
