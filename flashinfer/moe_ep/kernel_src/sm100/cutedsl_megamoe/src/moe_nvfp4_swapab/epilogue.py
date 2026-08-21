@@ -2396,7 +2396,7 @@ class SwapABSwigluFp4Epilogue:
 
         work_tile_info = sched_consumer.consume_work()
         while work_tile_info.is_valid_tile:
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+            if work_tile_info.is_linear1:
                 self._run_fc1_task_tile(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_tensor,
@@ -2431,7 +2431,7 @@ class SwapABSwigluFp4Epilogue:
                 )
             iket.range_pop()
 
-            cur_was_linear1 = work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+            cur_was_linear1 = work_tile_info.is_linear1
             cur_fc1_counter_slot = (
                 work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
             )

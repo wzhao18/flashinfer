@@ -63,6 +63,20 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         return self.phase_and_peek & Int32(PhaseMask)
 
     @property
+    def is_linear1(self):
+        phase = self.phase
+        return (phase == Int32(BlockPhase.Linear1)) | (
+            phase == Int32(BlockPhase.SharedLinear1)
+        )
+
+    @property
+    def is_shared(self):
+        phase = self.phase
+        return (phase == Int32(BlockPhase.SharedLinear1)) | (
+            phase == Int32(BlockPhase.SharedLinear2)
+        )
+
+    @property
     def peek_ready(self):
         """Decode the sched-warp counter peek result from slot 7's bit 16.
 
