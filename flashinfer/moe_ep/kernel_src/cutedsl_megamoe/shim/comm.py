@@ -95,9 +95,14 @@ def bootstrap_dist():
     return init_dist_and_nvshmem()
 
 
-def sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+def sym_zeros(
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    local_only: bool = False,
+) -> torch.Tensor:
     """Zero-initialised symmetric-heap tensor (plain CUDA when ``MEGA_NO_DIST=1``)."""
-    if _no_dist():
+    if local_only or _no_dist():
         tensor = torch.zeros(shape, dtype=dtype, device="cuda")
         # Tag so free_sym_tensor frees by allocation kind, not by whatever
         # MEGA_NO_DIST happens to be at free time (the env can be flipped
@@ -129,8 +134,10 @@ def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
 def _compute_peer_offsets(
     sym_tensor: torch.Tensor,
     world_size: int,
+    *,
+    local_only: bool = False,
 ) -> Tuple[int, Tuple[int, ...]]:
-    if _no_dist():
+    if local_only or _no_dist():
         local_base = int(sym_tensor.data_ptr())
         return local_base, tuple(0 for _ in range(world_size))
     import nvshmem.core
