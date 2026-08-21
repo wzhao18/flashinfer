@@ -278,11 +278,18 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
+        # IKR writes only epilogue tiles that cover live rows. Clear the same
+        # 64-row extent instead of the capacity-sized output workspace.
+        clear_tokens = min(
+            ((max(num_tokens, 1) + 63) // 64) * 64,
+            workspace.x.shape[0],
+        )
         key = (
             id(workspace),
             id(transformed_weights[0][0]),
             id(mega.compiled) if mega is not None and mega.compiled else None,
             stream,
+            clear_tokens,
         )
         state = self._thunk_state
         if state is None or state[0] != key or key[2] is None:
@@ -306,9 +313,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
+            thunk = fe.make_launch_thunk(
+                inputs, zero_num_tokens=clear_tokens
+            )
             mega = fe._mega
-            key = (key[0], key[1], id(mega.compiled), stream)
+            key = (key[0], key[1], id(mega.compiled), stream, clear_tokens)
             state = (key, thunk, workspace.output_activation)
             self._thunk_state = state
 
