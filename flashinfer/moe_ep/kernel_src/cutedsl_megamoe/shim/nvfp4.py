@@ -1537,6 +1537,7 @@ def create_dummy_inputs(
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
+    knobs: Optional[dict] = None,
     seed: int = 0,
 ) -> tuple[
     torch.Tensor,
@@ -1588,6 +1589,7 @@ def create_dummy_inputs(
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
+        knobs=knobs,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(
