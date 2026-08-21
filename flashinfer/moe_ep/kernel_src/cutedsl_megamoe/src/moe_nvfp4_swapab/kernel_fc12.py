@@ -1685,9 +1685,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
-                    BlockPhase.Linear1
-                )
+                is_phase_linear1 = work_tile_info.is_linear1
 
                 if is_phase_linear1:
                     # ── fc1 phase A-side ─────────────────────────────────
@@ -1894,9 +1892,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
-                    BlockPhase.Linear1
-                )
+                is_phase_linear1 = work_tile_info.is_linear1
 
                 if is_phase_linear1:
                     # ── fc1 phase B-side (activation + activation_sf) ────
@@ -2190,9 +2186,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
-                    BlockPhase.Linear1
-                )
+                is_phase_linear1 = work_tile_info.is_linear1
                 # Prebind k_tile_cnt due to DSL AST.
                 k_tile_cnt = cutlass.Int32(0)
                 if is_phase_linear1:
