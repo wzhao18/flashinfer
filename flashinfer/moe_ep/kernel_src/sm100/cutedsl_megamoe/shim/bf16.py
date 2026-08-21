@@ -50,6 +50,10 @@ class MegaMoEBf16Config:
     gate_up_clamp: Optional[float] = None
     apply_topk_in_fc1: bool = True
     enable_iket: bool = False
+    max_active_clusters: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: float = 4.0
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -83,8 +87,17 @@ class MegaMoEBf16Config:
             )
         if self.in_kernel_fc2_reduce and self.token_back_mode == "epi_warps":
             raise ValueError(
-                "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
+                "in_kernel_fc2_reduce requires standalone or reused dispatch "
+                "token-back."
             )
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(f"unsupported activation={self.activation!r}.")
+        if self.max_active_clusters is not None and self.max_active_clusters <= 0:
+            raise ValueError("max_active_clusters must be positive when provided.")
+        if self.activation == "situ" and self.situ_beta <= 0:
+            raise ValueError("situ_beta must be positive.")
+        if self.situ_linear_beta is not None and self.situ_linear_beta <= 0:
+            raise ValueError("situ_linear_beta must be positive when provided.")
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -181,6 +194,10 @@ class MegaMoEBf16Frontend:
             self._gate_up_clamp,
             c.apply_topk_in_fc1,
             c.enable_iket,
+            c.max_active_clusters,
+            c.activation,
+            c.situ_beta,
+            c.situ_linear_beta,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
@@ -199,7 +216,11 @@ class MegaMoEBf16Frontend:
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        max_active_clusters = max(1, sm_count // cluster_size)
+        hardware_clusters = max(1, sm_count // cluster_size)
+        max_active_clusters = min(
+            hardware_clusters,
+            c.max_active_clusters or hardware_clusters,
+        )
         kernel = Sm100MegaMoEBf16Kernel(
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
@@ -229,6 +250,14 @@ class MegaMoEBf16Frontend:
             gate_up_clamp=self._gate_up_clamp,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
         )
+        if c.activation == "situ":
+            from .bf16_situ import install_situ_metadata
+
+            install_situ_metadata(
+                kernel,
+                situ_beta=c.situ_beta,
+                situ_linear_beta=c.situ_linear_beta,
+            )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")
         shared_workspace = sym_zeros((shared_bytes,), torch.uint8)
@@ -247,7 +276,16 @@ class MegaMoEBf16Frontend:
         kwargs["max_active_clusters"] = max_active_clusters
         if c.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(kernel, **kwargs)
+        if c.activation == "situ":
+            from .bf16_situ import bf16_epilogue_compile_context
+
+            with bf16_epilogue_compile_context(
+                situ_beta=c.situ_beta,
+                situ_linear_beta=c.situ_linear_beta,
+            ):
+                mega.compiled = cute.compile(kernel, **kwargs)
+        else:
+            mega.compiled = cute.compile(kernel, **kwargs)
         self._mega = mega
         self._mega_key = key
         return mega
@@ -430,6 +468,9 @@ def get_symm_buffer_for_bf16_mega_moe(
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: float = 4.0,
+    situ_linear_beta: Optional[float] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
@@ -462,6 +503,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         intermediate=intermediate,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
