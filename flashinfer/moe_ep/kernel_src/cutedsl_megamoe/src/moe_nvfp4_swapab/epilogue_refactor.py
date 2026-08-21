@@ -1201,7 +1201,7 @@ class SwapABSwigluFp4Epilogue:
             else:
                 tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+            if work_tile_info.is_linear1:
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
                 fc1_epi(
                     work_tile_info=work_tile_info,
@@ -1222,9 +1222,7 @@ class SwapABSwigluFp4Epilogue:
             iket.range_pop()
 
             prev_work_tile_info = work_tile_info
-            cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(
-                BlockPhase.Linear1
-            )
+            cur_was_linear1 = prev_work_tile_info.is_linear1
 
             acc_consumer_state.advance()
             if cutlass.const_expr(self.overlapping_accum):

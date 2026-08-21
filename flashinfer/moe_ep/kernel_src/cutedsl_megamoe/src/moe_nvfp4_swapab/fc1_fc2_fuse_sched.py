@@ -51,6 +51,8 @@ class BlockPhase(IntEnum):
     None_ = 0
     Linear1 = 1
     Linear2 = 2
+    SharedLinear1 = 3
+    SharedLinear2 = 4
 
 
 # =============================================================================
@@ -287,6 +289,9 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # serialization is type-discriminated below.
         expert_token_sizes: Optional[cute.Tensor] = None,
         expert_token_prefix_sum: Optional[cute.Tensor] = None,
+        shared_shape: Optional[
+            Tuple[int | Int32, int | Int32, int | Int32]
+        ] = None,
     ):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
@@ -334,6 +339,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
+        self.shared_shape = shared_shape
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -380,6 +386,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             values.extend(extract_mlir_values(self.expert_token_sizes))
         else:
             values.extend(extract_mlir_values(self.expert_token_prefix_sum))
+        if self.shared_shape is not None:
+            for value in self.shared_shape:
+                if isinstance(value, Int32):
+                    values.extend(extract_mlir_values(value))
         return values
 
     def __new_from_mlir_values__(
@@ -441,6 +451,17 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             )
             idx += t_len
             result.expert_token_sizes = None
+        if self.shared_shape is None:
+            result.shared_shape = None
+        else:
+            shared_shape = []
+            for value in self.shared_shape:
+                if isinstance(value, Int32):
+                    shared_shape.append(new_from_mlir_values(value, [values[idx]]))
+                    idx += 1
+                else:
+                    shared_shape.append(value)
+            result.shared_shape = tuple(shared_shape)
         assert idx == len(values), (
             f"Fused fc12 sched params type-discrim mismatch: idx={idx} "
             f"len(values)={len(values)}"
@@ -475,6 +496,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # avoid recomputing in the hot path of advance / decode).
         num_fc1_intermediate_blocks: Int32,
         num_fc2_hidden_blocks: Int32,
+        num_shared_fc1_blocks: Int32,
+        num_shared_fc2_blocks: Int32,
+        num_shared_token_blocks: Int32,
         ext,
         sched_pipeline,
         smem_buf_tensor,
@@ -497,6 +521,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         self._dynamic_state = dynamic_state
         self._num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self._num_fc2_hidden_blocks = num_fc2_hidden_blocks
+        self._num_shared_fc1_blocks = num_shared_fc1_blocks
+        self._num_shared_fc2_blocks = num_shared_fc2_blocks
+        self._num_shared_token_blocks = num_shared_token_blocks
         self._ext = ext
         self._pipeline = sched_pipeline
         self._smem_buf_tensor = smem_buf_tensor
@@ -664,6 +691,22 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_fc2_hidden_blocks = (
             hidden + params.cluster_tile_n - 1
         ) // params.cluster_tile_n
+        num_shared_fc1_blocks = Int32(0)
+        num_shared_fc2_blocks = Int32(0)
+        num_shared_token_blocks = Int32(0)
+        if const_expr(params.shared_shape is not None):
+            shared_tokens, shared_intermediate_gateup, shared_hidden = (
+                params.shared_shape
+            )
+            num_shared_fc1_blocks = (
+                shared_intermediate_gateup + params.cluster_tile_n - 1
+            ) // params.cluster_tile_n
+            num_shared_fc2_blocks = (
+                shared_hidden + params.cluster_tile_n - 1
+            ) // params.cluster_tile_n
+            num_shared_token_blocks = (
+                shared_tokens + params.cluster_tile_m - 1
+            ) // params.cluster_tile_m
 
         # current_work init must use ext.WorkTileInfo to match the shape that
         # gen_next_work writes; otherwise MLIR serialization slots would differ.
@@ -749,6 +792,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             dynamic_state=dynamic_state,
             num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+            num_shared_fc1_blocks=num_shared_fc1_blocks,
+            num_shared_fc2_blocks=num_shared_fc2_blocks,
+            num_shared_token_blocks=num_shared_token_blocks,
             ext=ext,
             sched_pipeline=sched_pipeline,
             smem_buf_tensor=smem_buf_tensor,
@@ -757,6 +803,76 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             producer_state=producer_state,
             sched_storage=sched_storage,
         )
+
+    # -------------------------------------------------------------------------
+    # Shared-expert task space
+    # -------------------------------------------------------------------------
+
+    @dsl_user_op
+    @cute.jit
+    def gen_shared_work(
+        self,
+        cluster_linear_tile_idx: Int32,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Decode one rank-local shared FC1/FC2 cluster tile."""
+        params = self.params
+        base_work = self._ext.WorkTileInfo(
+            expert_idx=Int32(WorkTileState.DONE),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            cumulative_data_physical_row=Int32(0),
+            cumulative_sf_physical_row=Int32(0),
+            cumulative_token_block_count=Int32(0),
+            valid_tokens_in_cta_tile=Int32(0),
+            phase_and_peek=Int32(BlockPhase.None_),
+        )
+        num_fc1_tiles = (
+            self._num_shared_token_blocks * self._num_shared_fc1_blocks
+        )
+        num_fc2_tiles = (
+            self._num_shared_token_blocks * self._num_shared_fc2_blocks
+        )
+        if cluster_linear_tile_idx < num_fc1_tiles + num_fc2_tiles:
+            phase = Int32(BlockPhase.SharedLinear1)
+            local_idx = cluster_linear_tile_idx
+            num_output_blocks = self._num_shared_fc1_blocks
+            if cluster_linear_tile_idx >= num_fc1_tiles:
+                phase = Int32(BlockPhase.SharedLinear2)
+                local_idx = cluster_linear_tile_idx - num_fc1_tiles
+                num_output_blocks = self._num_shared_fc2_blocks
+
+            cluster_token_block_idx = local_idx // num_output_blocks
+            cluster_output_block_idx = (
+                local_idx - cluster_token_block_idx * num_output_blocks
+            )
+            cta_token_block_idx = (
+                cluster_token_block_idx * params.cluster_shape_mn[0]
+                + self.cta_id_in_cluster[0]
+            )
+            cta_output_block_idx = (
+                cluster_output_block_idx * params.cluster_shape_mn[1]
+                + self.cta_id_in_cluster[1]
+            )
+            token_start = cta_token_block_idx * params.cta_tile_shape_mnk[0]
+            remaining_tokens = params.shared_shape[0] - token_start
+            valid_tokens = cutlass.min(
+                cutlass.max(remaining_tokens, Int32(0)),
+                Int32(params.cta_tile_shape_mnk[0]),
+            )
+            base_work = self._ext.WorkTileInfo(
+                expert_idx=Int32(0),
+                tile_m_idx=cta_output_block_idx,
+                tile_n_idx=cta_token_block_idx,
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_tile=valid_tokens,
+                phase_and_peek=phase,
+            )
+        self.current_work = self._ext.enrich_work_tile_info(base_work)
 
     # -------------------------------------------------------------------------
     # internal_init: first-tile pre-init before pipeline_init_arrive
@@ -1423,6 +1539,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         values.extend(extract_mlir_values(self._fused_state))
         values.extend(extract_mlir_values(self._num_fc1_intermediate_blocks))
         values.extend(extract_mlir_values(self._num_fc2_hidden_blocks))
+        values.extend(extract_mlir_values(self._num_shared_fc1_blocks))
+        values.extend(extract_mlir_values(self._num_shared_fc2_blocks))
+        values.extend(extract_mlir_values(self._num_shared_token_blocks))
         if self.params.load_balance_mode == "atomic_counter":
             values.extend(extract_mlir_values(self._dynamic_state))
         values.extend(extract_mlir_values(self._producer_state))
@@ -1447,6 +1566,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         new_fused_state = _take(self._fused_state)
         new_num_fc1_intermediate_blocks = _take(self._num_fc1_intermediate_blocks)
         new_num_fc2_hidden_blocks = _take(self._num_fc2_hidden_blocks)
+        new_num_shared_fc1_blocks = _take(self._num_shared_fc1_blocks)
+        new_num_shared_fc2_blocks = _take(self._num_shared_fc2_blocks)
+        new_num_shared_token_blocks = _take(self._num_shared_token_blocks)
         new_dynamic_state = (
             _take(self._dynamic_state)
             if self.params.load_balance_mode == "atomic_counter"
@@ -1464,6 +1586,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         result._fused_state = new_fused_state
         result._num_fc1_intermediate_blocks = new_num_fc1_intermediate_blocks
         result._num_fc2_hidden_blocks = new_num_fc2_hidden_blocks
+        result._num_shared_fc1_blocks = new_num_shared_fc1_blocks
+        result._num_shared_fc2_blocks = new_num_shared_fc2_blocks
+        result._num_shared_token_blocks = new_num_shared_token_blocks
         result._dynamic_state = new_dynamic_state
         result._ext = self._ext
         result._pipeline = self._pipeline
