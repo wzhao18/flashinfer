@@ -119,6 +119,11 @@ from .bf16 import (
     bf16_mega_moe,
     get_symm_buffer_for_bf16_mega_moe,
 )
+from .bf16_shared import (
+    FusedBf16SituMlpConfig,
+    FusedBf16SituMlpFrontend,
+    fused_bf16_situ_mlp,
+)
 
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
@@ -216,6 +221,9 @@ __all__ = [
     "bf16_mega_launch_thunk",
     "bf16_mega_moe",
     "get_symm_buffer_for_bf16_mega_moe",
+    "FusedBf16SituMlpConfig",
+    "FusedBf16SituMlpFrontend",
+    "fused_bf16_situ_mlp",
     # tuner
     "tuner",
     "CORRECTNESS_KNOBS",

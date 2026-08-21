@@ -12,5 +12,6 @@ def test_bf16_megamoe_public_reference_is_lazy():
 
     assert callable(megamoe.get_symm_buffer_for_bf16_mega_moe)
     assert callable(megamoe.bf16_mega_moe)
+    assert callable(megamoe.fused_bf16_situ_mlp)
     # Resolving the raw reference happens only on a GPU test host with CuTeDSL.
     assert "compute_megamoe_reference_bf16" in megamoe.__all__
