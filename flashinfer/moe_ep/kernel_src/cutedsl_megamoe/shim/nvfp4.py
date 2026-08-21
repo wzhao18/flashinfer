@@ -359,9 +359,7 @@ class MegaMoENvfp4Frontend:
         if self.config.fc2_reduces_topk:
             # ikr accumulate-from-zero contract: output_activation is the
             # cross-rank REDG atomic-add target, so it must be zeroed before
-            # every launch (stream-ordered; ~10 us at 2048 tokens).  Zero the
-            # full raw buffer so stale rows beyond a partial num_tokens can't
-            # leak from an earlier, larger launch.
+            # every launch.
             inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
 
@@ -376,6 +374,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
+        zero_num_tokens: Optional[int] = None,
     ) -> Callable[[], None]:
         """Zero-arg launcher with args prebuilt (compiles if needed).
 
@@ -389,6 +388,8 @@ class MegaMoENvfp4Frontend:
         With ``in_kernel_fc2_reduce`` the thunk is two stream-ordered nodes --
         ``output_activation.zero_()`` then the kernel launch (accumulate-from-
         zero contract of the REDG target); both are CUDA-graph capturable.
+        ``zero_num_tokens`` limits that clear to a leading row extent without
+        changing the capacity-specialized kernel launch.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
@@ -398,10 +399,23 @@ class MegaMoENvfp4Frontend:
         compiled = mega.compiled
 
         if self.config.fc2_reduces_topk:
-            output_activation = inputs.output_activation
+            output_activation = launch_inputs.output_activation
+            if zero_num_tokens is not None:
+                if (
+                    zero_num_tokens < 1
+                    or zero_num_tokens > inputs.output_activation.shape[0]
+                ):
+                    raise ValueError(
+                        "zero_num_tokens must be in "
+                        f"[1, {inputs.output_activation.shape[0]}], "
+                        f"got {zero_num_tokens}."
+                    )
+                output_activation = inputs.output_activation[:zero_num_tokens]
 
             def thunk() -> None:
                 output_activation.zero_()
+                # The kernel's opening cross-rank dispatch barrier orders
+                # every stream-local clear before any peer REDG store.
                 compiled(**runtime_kwargs)
 
         else:
@@ -1333,10 +1347,7 @@ def nvfp4_mega_moe(
         output_activation=symm_buffer.output_activation,
     )
 
-    # The kernel reduces the top-k combine internally and writes the final 2D
-    # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
-    # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
-    # live [:n] rows out -- matches the reference driver, which does not slice.
+    # The persistent kernel's cross-rank token addressing is capacity-specialized.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream

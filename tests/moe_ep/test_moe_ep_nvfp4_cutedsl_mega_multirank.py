@@ -246,6 +246,9 @@ def _reference_nvfp4_mega_moe_staged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        activation=problem["activation"],
+        situ_beta=problem["situ_beta"],
+        situ_linear_beta=problem["situ_linear_beta"],
         combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -278,9 +281,6 @@ def _reference_nvfp4_mega_moe_staged(
         symm_buffer,
         num_tokens=num_tokens,
         gate_up_clamp=problem["gate_up_clamp"],
-        activation=problem["activation"],
-        situ_beta=problem["situ_beta"],
-        situ_linear_beta=problem["situ_linear_beta"],
         fast_math=problem["fast_math"],
     )
     torch.cuda.synchronize()
@@ -519,6 +519,15 @@ def _run_mega_layer(
             **tensor_kwargs,
         )
         y_layer = mega.forward(t).clone()
+        clear_tokens = min(
+            ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
+            problem["max_tokens"],
+        )
+        untouched_tail = (
+            in_kernel_fc2_reduce and clear_tokens < problem["max_tokens"]
+        )
+        if untouched_tail:
+            mega._workspace.output_activation[clear_tokens:].fill_(7.0)
         # Repeated forward on the same session: with no per-launch host reset
         # (run() default reset_counters=False) the second launch relies on the
         # kernel's tail cleanup of its workspace counters/flags -- this is the
@@ -538,6 +547,10 @@ def _run_mega_layer(
             assert torch.equal(y_view_repeat, y_layer)
 
         torch.cuda.synchronize()
+        if untouched_tail:
+            assert torch.all(
+                mega._workspace.output_activation[clear_tokens:] == 7.0
+            )
         dist.barrier()
 
         if quantize_input:
@@ -715,7 +728,12 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(
-        rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=20,
+        max_tokens=256,
+        in_kernel_fc2_reduce=True,
     )
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
@@ -812,6 +830,9 @@ def _run_mega_layer_zero_token_ikr_regression(
             intermediate=intermediate,
             topk=topk,
             gate_up_clamp=10.0,
+            activation="swiglu",
+            situ_beta=None,
+            situ_linear_beta=None,
             fast_math=True,
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
@@ -1217,6 +1238,7 @@ def _run_mega_torch_oracle(
     [
         (False, "bf16", "swiglu"),
         (True, "bf16", "swiglu"),
+        (True, "bf16", "situ"),
         (False, "nvfp4", "swiglu"),
         (False, "mxfp8", "swiglu"),
     ],
