@@ -288,6 +288,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self,
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
+        num_tokens: int | None = None,
     ) -> tuple:
         kcfg = self._kernel_config
         fe = workspace._frontend
@@ -297,6 +298,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
+        # IKR only writes the 64-row tiles covering live tokens.
+        clear_tokens = (
+            workspace.x.shape[0]
+            if num_tokens is None
+            else min(((max(num_tokens, 1) + 63) // 64) * 64, workspace.x.shape[0])
+        )
         weight_identity = tuple(
             id(tensor) for transformed in transformed_weights for tensor in transformed
         )
@@ -305,16 +312,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             weight_identity,
             id(mega.compiled) if mega is not None and mega.compiled else None,
             stream,
+            clear_tokens,
         )
         state = self._thunk_states.get(key)
         if state is None or key[2] is None:
             inputs = self._mega_inputs(workspace, transformed_weights)
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
+            thunk = fe.make_launch_thunk(inputs, zero_num_tokens=clear_tokens)
             mega = fe._mega
             assert mega is not None and mega.compiled is not None
-            key = (key[0], key[1], id(mega.compiled), stream)
+            key = (key[0], key[1], id(mega.compiled), stream, clear_tokens)
             state = (key, thunk, workspace.output_activation)
             self._thunk_states[key] = state
         return state
@@ -374,7 +382,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/activation change nulls the compiled session,
         # changing the key and forcing a rebuild through the validated path.
-        state = self._prepared_thunk_state(workspace, transformed_weights)
+        state = self._prepared_thunk_state(workspace, transformed_weights, num_tokens)
         key, thunk, out_buf = state
         reducer_state = None
         if workspace._frontend.config.defer_topk_reduce:
