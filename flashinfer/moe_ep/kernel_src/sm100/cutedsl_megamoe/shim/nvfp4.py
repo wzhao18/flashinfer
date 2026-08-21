@@ -117,6 +117,7 @@ class MegaMoENvfp4Config:
     enable_iket: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_beta: Optional[float] = None
+    local_only: bool = False
 
     def __post_init__(self) -> None:
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
@@ -128,6 +129,8 @@ class MegaMoENvfp4Config:
                 f"rank must be in [0, world_size), got rank={self.rank}, "
                 f"world_size={self.world_size}."
             )
+        if self.local_only and self.world_size != 1:
+            raise ValueError("local_only requires world_size=1.")
         if self.num_tokens_per_rank <= 0:
             raise ValueError(
                 f"num_tokens_per_rank must be positive, got {self.num_tokens_per_rank}."
@@ -551,6 +554,7 @@ class MegaMoENvfp4Frontend:
             c.swiglu_alpha,
             c.swiglu_beta,
             c.enable_iket,
+            c.local_only,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -642,10 +646,13 @@ class MegaMoENvfp4Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+        shared_workspace = sym_zeros(
+            (shared_ws_bytes,), torch.uint8, local_only=c.local_only
+        )
         symmetric_base, peer_offsets_list = _compute_peer_offsets(
             shared_workspace,
             c.world_size,
+            local_only=c.local_only,
         )
 
         mega = _CompiledMega(
@@ -1040,6 +1047,8 @@ def _resolve_per_expert_epilogue(
 def _sym_zeros_byte_view(
     logical_shape: Tuple[int, ...],
     target_dtype: torch.dtype,
+    *,
+    local_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """NVFP4 / fp8 symmetric heap via uint8 reinterpret (matches mega_runner).
 
@@ -1062,7 +1071,7 @@ def _sym_zeros_byte_view(
     total_bytes = 1
     for dim_size in storage_shape:
         total_bytes *= dim_size
-    root = sym_zeros((total_bytes,), torch.uint8)
+    root = sym_zeros((total_bytes,), torch.uint8, local_only=local_only)
     view = root.view(target_dtype).reshape(storage_shape)
     return view, root
 
@@ -1149,6 +1158,7 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
+    local_only: bool = False,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1250,6 +1260,7 @@ def get_symm_buffer_for_mega_moe(
         token_back_mode=(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
+        local_only=local_only,
     )
     cfg = with_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
@@ -1265,20 +1276,27 @@ def get_symm_buffer_for_mega_moe(
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
 
     sym_roots: list[torch.Tensor] = []
-    x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
+    x, x_root = _sym_zeros_byte_view(
+        (num_max_tokens, hidden), _DataDtype, local_only=local_only
+    )
     sym_roots.append(x_root)
     x_sf, x_sf_root = _sym_zeros_byte_view(
         (num_max_tokens, hidden_sf_cols_padded),
         _ScaleDtype,
+        local_only=local_only,
     )
     sym_roots.append(x_sf_root)
-    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
+    topk_idx = sym_zeros(
+        (num_max_tokens, num_topk), torch.int64, local_only=local_only
+    )
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
     # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
     # tail, but start from the masked state so a partial first staging is safe.
     topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
-    topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
+    topk_weights = sym_zeros(
+        (num_max_tokens, num_topk), torch.float32, local_only=local_only
+    )
     sym_roots.append(topk_weights)
     # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
     # internally.  Allocated on the symmetric heap unconditionally: under
@@ -1288,7 +1306,9 @@ def get_symm_buffer_for_mega_moe(
     # the knob can flip per-compile (autotune / apply_knobs) without
     # reallocating; the cost ((T, hidden) bf16) is negligible next to the
     # internal combine staging.
-    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+    output_activation = sym_zeros(
+        (num_max_tokens, hidden), torch.bfloat16, local_only=local_only
+    )
     sym_roots.append(output_activation)
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
