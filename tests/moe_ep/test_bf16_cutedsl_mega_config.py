@@ -8,6 +8,9 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.config 
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16_shared import (
+    FusedBf16SituMlpConfig,
+)
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
     bf16_candidates,
 )
@@ -45,6 +48,47 @@ def test_bf16_frontend_rejects_unsupported_shapes(
         )
 
 
+def test_bf16_frontend_accepts_situ_activation():
+    config = MegaMoEBf16Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=2,
+        hidden=32,
+        intermediate=64,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    assert config.activation == "situ"
+    assert config.situ_beta == 4.0
+    assert config.situ_linear_beta == 25.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"activation": "gelu"}, "unsupported activation"),
+        ({"activation": "situ", "situ_beta": 0.0}, "situ_beta"),
+        ({"activation": "situ", "situ_linear_beta": 0.0}, "situ_linear_beta"),
+        ({"max_active_clusters": 0}, "max_active_clusters"),
+    ),
+)
+def test_bf16_frontend_rejects_invalid_activation(kwargs: dict, message: str):
+    with pytest.raises(ValueError, match=message):
+        MegaMoEBf16Config(
+            rank=0,
+            world_size=1,
+            num_tokens_per_rank=64,
+            num_topk=2,
+            num_total_experts=2,
+            hidden=32,
+            intermediate=64,
+            **kwargs,
+        )
+
+
 def test_bf16_backend_defaults_to_scale_free_contract():
     config = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=64, top_k=1)
     assert config.kernel_name == "sm100_bf16_bf16_bf16_cutedsl"
@@ -58,3 +102,23 @@ def test_bf16_backend_accepts_collective_autotune():
         ).knobs
         == "auto"
     )
+
+
+def test_fused_bf16_situ_shared_expert_config():
+    config = FusedBf16SituMlpConfig(
+        capacity=256,
+        hidden=7168,
+        intermediate=6144,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    assert config.capacity == 256
+
+    with pytest.raises(ValueError, match="multiple of 64"):
+        FusedBf16SituMlpConfig(
+            capacity=255,
+            hidden=7168,
+            intermediate=6144,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
