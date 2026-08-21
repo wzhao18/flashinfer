@@ -1467,6 +1467,8 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
         MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
     with pytest.raises(ValueError, match="max_active_clusters"):
         MegaMoENvfp4Config(**base, max_active_clusters=0)
+    with pytest.raises(ValueError, match="local_only requires world_size=1"):
+        MegaMoENvfp4Config(**(base | {"world_size": 2}), local_only=True)
 
 
 def test_tuner_is_valid_quantized_combine_rules():
