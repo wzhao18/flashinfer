@@ -356,7 +356,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(shared.output_activation, reference)
-    print("backend split launch and correctness passed")
+    print("backend fused launch and correctness passed")
 
     routed_only_frontend = MegaMoENvfp4Frontend(
         dataclasses.replace(
