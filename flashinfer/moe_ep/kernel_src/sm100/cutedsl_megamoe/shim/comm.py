@@ -179,6 +179,7 @@ class _CompiledMega:
     shared_workspace: torch.Tensor
     symmetric_base: int
     peer_offsets_list: Tuple[int, ...]
+    owns_workspaces: bool = True
     # Launch-kwargs cache: rebuilding the cute tensor views (12x from_dlpack +
     # SymBufferHost) and re-validating inputs costs real host time per launch,
     # and the launch inputs are stable session buffers in steady state.  Keyed
