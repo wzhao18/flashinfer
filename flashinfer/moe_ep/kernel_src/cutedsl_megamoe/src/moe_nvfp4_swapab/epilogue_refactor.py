@@ -1147,6 +1147,13 @@ class SwapABSwigluFp4Epilogue:
         tidx: cutlass.Int32,
         optional_epi_args: NvFp4OptinalEpiArgs = None,  # Epilogue optinal runtime arguments.
         token_comm_args=None,  # Only valid when enable token communication
+        shared_base=None,
+        shared_tma_atom_fc1_output=None,
+        shared_fc1_output=None,
+        shared_fc1_output_sf=None,
+        shared_fc2_output=None,
+        shared_fc1_done_counter=None,
+        shared_optional_epi_args=None,
     ):
         if cutlass.const_expr(optional_epi_args is None):
             optional_epi_args = NvFp4OptinalEpiArgs(
@@ -1177,6 +1184,28 @@ class SwapABSwigluFp4Epilogue:
         fc2_epi = SwapABFc2Epilogue(
             self, tidx, epi_smem_storage, fc2_output, token_comm_args, optional_epi_args
         )
+        shared_fc1_epi = None
+        shared_fc2_epi = None
+        if cutlass.const_expr(shared_base is not None):
+            shared_fc1_epi = SwapABFc1Epilogue(
+                shared_base,
+                tidx,
+                epi_smem_storage,
+                sched_ext,
+                shared_tma_atom_fc1_output,
+                shared_fc1_output,
+                shared_fc1_output_sf,
+                shared_fc1_done_counter,
+                shared_optional_epi_args,
+            )
+            shared_fc2_epi = SwapABFc2Epilogue(
+                shared_base,
+                tidx,
+                epi_smem_storage,
+                shared_fc2_output,
+                None,
+                shared_optional_epi_args,
+            )
 
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_acc_pipeline_stages
@@ -1202,23 +1231,57 @@ class SwapABSwigluFp4Epilogue:
                 tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
             if work_tile_info.is_linear1:
-                # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc1_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                    is_odd_turn=is_odd_turn,
-                )
+                if cutlass.const_expr(shared_base is not None):
+                    if work_tile_info.is_shared:
+                        shared_fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                        )
+                    else:
+                        fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                        )
+                else:
+                    fc1_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                        is_odd_turn=is_odd_turn,
+                    )
             else:
-                # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc2_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                    is_odd_turn=is_odd_turn,
-                )
+                if cutlass.const_expr(shared_base is not None):
+                    if work_tile_info.is_shared:
+                        shared_fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                        )
+                    else:
+                        fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                        )
+                else:
+                    fc2_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                        is_odd_turn=is_odd_turn,
+                    )
             iket.range_pop()
 
             prev_work_tile_info = work_tile_info
@@ -1239,13 +1302,33 @@ class SwapABSwigluFp4Epilogue:
 
             # Publish completion for the work tile snapshotted above.
             if cur_was_linear1:
-                flag_tracker = fc1_epi.signal_fc1_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
+                if cutlass.const_expr(shared_base is not None):
+                    if prev_work_tile_info.is_shared:
+                        flag_tracker = shared_fc1_epi.signal_fc1_done(
+                            prev_work_tile_info, work_tile_info, flag_tracker
+                        )
+                    else:
+                        flag_tracker = fc1_epi.signal_fc1_done(
+                            prev_work_tile_info, work_tile_info, flag_tracker
+                        )
+                else:
+                    flag_tracker = fc1_epi.signal_fc1_done(
+                        prev_work_tile_info, work_tile_info, flag_tracker
+                    )
             else:
-                flag_tracker = fc2_epi.signal_fc2_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
+                if cutlass.const_expr(shared_base is not None):
+                    if prev_work_tile_info.is_shared:
+                        flag_tracker = shared_fc2_epi.signal_fc2_done(
+                            prev_work_tile_info, work_tile_info, flag_tracker
+                        )
+                    else:
+                        flag_tracker = fc2_epi.signal_fc2_done(
+                            prev_work_tile_info, work_tile_info, flag_tracker
+                        )
+                else:
+                    flag_tracker = fc2_epi.signal_fc2_done(
+                        prev_work_tile_info, work_tile_info, flag_tracker
+                    )
         # Tail flush
         flag_tracker.fire()
 

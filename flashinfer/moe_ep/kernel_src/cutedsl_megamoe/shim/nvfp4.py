@@ -59,7 +59,7 @@ from .comm import (
     resolve_gate_up_clamp,
     sym_zeros,
 )
-from common.megamoe_constants import Nvfp4BlockSize
+from common.megamoe_constants import Nvfp4BlockSize, SfPaddingBlock
 from moe_nvfp4_swapab.runner_common import (
     _DataDtype,
     _ScaleDtype,
@@ -114,6 +114,8 @@ class MegaMoENvfp4Config:
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
     local_only: bool = False
+    shared_hidden: Optional[int] = None
+    shared_intermediate: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.world_size < 1:
@@ -125,6 +127,15 @@ class MegaMoENvfp4Config:
             )
         if self.local_only and self.world_size != 1:
             raise ValueError("local_only requires world_size=1.")
+        if (self.shared_hidden is None) != (self.shared_intermediate is None):
+            raise ValueError(
+                "shared_hidden and shared_intermediate must be provided together."
+            )
+        if self.shared_hidden is not None:
+            if self.shared_hidden % 64 or self.shared_intermediate % 64:
+                raise ValueError(
+                    "shared_hidden and shared_intermediate must be multiples of 64."
+                )
         if self.num_tokens_per_rank <= 0:
             raise ValueError(
                 f"num_tokens_per_rank must be positive, got {self.num_tokens_per_rank}."
@@ -232,6 +243,23 @@ class MegaMoENvfp4Config:
 
 
 @dataclasses.dataclass
+class MegaMoESharedNvfp4Inputs:
+    activation: torch.Tensor
+    activation_sf: torch.Tensor
+    fc1_weight: torch.Tensor
+    fc1_weight_sf: torch.Tensor
+    fc1_output: torch.Tensor
+    fc1_output_sf: torch.Tensor
+    fc2_weight: torch.Tensor
+    fc2_weight_sf: torch.Tensor
+    fc1_alpha: torch.Tensor
+    fc2_alpha: torch.Tensor
+    fc1_norm_const: torch.Tensor
+    fc1_done_counter: torch.Tensor
+    output_activation: torch.Tensor
+
+
+@dataclasses.dataclass
 class MegaMoENvfp4Inputs:
     """Per-rank tensors for one NVFP4 MegaMoE launch.
 
@@ -256,6 +284,7 @@ class MegaMoENvfp4Inputs:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     output_activation: torch.Tensor
+    shared: Optional[MegaMoESharedNvfp4Inputs] = None
 
 
 class MegaMoENvfp4Frontend:
@@ -440,6 +469,12 @@ class MegaMoENvfp4Frontend:
         # count: _slice_inputs slices from row 0, so the sliced views keep
         # these data_ptrs and the count captures the shape.
         t = inputs
+        shared_key = ()
+        if t.shared is not None:
+            shared_key = tuple(
+                getattr(t.shared, field.name).data_ptr()
+                for field in dataclasses.fields(t.shared)
+            )
         return (
             t.activation.data_ptr(),
             t.activation_sf.data_ptr(),
@@ -453,6 +488,7 @@ class MegaMoENvfp4Frontend:
             t.fc2_alpha.data_ptr(),
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
+            *shared_key,
             num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -471,6 +507,8 @@ class MegaMoENvfp4Frontend:
             c.num_total_experts,
             c.hidden,
             c.intermediate,
+            c.shared_hidden,
+            c.shared_intermediate,
             c.mma_tiler_mnk,
             c.cluster_shape_mnk,
             c.use_2cta_instrs,
@@ -555,6 +593,8 @@ class MegaMoENvfp4Frontend:
             num_topk=c.num_topk,
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
+            shared_hidden=c.shared_hidden,
+            shared_intermediate=c.shared_intermediate,
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
@@ -674,6 +714,23 @@ class MegaMoENvfp4Frontend:
     ) -> MegaMoENvfp4Inputs:
         tok = slice(None, num_tokens)
 
+        shared = inputs.shared
+        if shared is not None:
+            shared = MegaMoESharedNvfp4Inputs(
+                activation=shared.activation[tok],
+                activation_sf=shared.activation_sf,
+                fc1_weight=shared.fc1_weight,
+                fc1_weight_sf=shared.fc1_weight_sf,
+                fc1_output=shared.fc1_output[tok],
+                fc1_output_sf=shared.fc1_output_sf,
+                fc2_weight=shared.fc2_weight,
+                fc2_weight_sf=shared.fc2_weight_sf,
+                fc1_alpha=shared.fc1_alpha,
+                fc2_alpha=shared.fc2_alpha,
+                fc1_norm_const=shared.fc1_norm_const,
+                fc1_done_counter=shared.fc1_done_counter,
+                output_activation=shared.output_activation[tok],
+            )
         return MegaMoENvfp4Inputs(
             activation=inputs.activation[tok],
             activation_sf=inputs.activation_sf[tok],
@@ -687,6 +744,7 @@ class MegaMoENvfp4Frontend:
             fc2_alpha=inputs.fc2_alpha,
             fc1_norm_const=inputs.fc1_norm_const,
             output_activation=inputs.output_activation[tok],
+            shared=shared,
         )
 
     def _validate_inputs(
@@ -851,6 +909,94 @@ class MegaMoENvfp4Frontend:
             if tensor.dtype != torch.float32:
                 raise ValueError(f"{name} must be float32, got {tensor.dtype}.")
 
+        shared = inputs.shared
+        if (shared is None) != (c.shared_hidden is None):
+            raise ValueError(
+                "shared inputs and shared kernel dimensions must be provided together."
+            )
+        if shared is not None:
+            shared_hidden = c.shared_hidden
+            shared_gateup = c.shared_intermediate
+            assert shared_hidden is not None and shared_gateup is not None
+            shared_down = shared_gateup // 2
+            shared_shapes = (
+                ("activation", shared.activation, (buf_tokens, shared_hidden // 2), _DataDtype),
+                (
+                    "fc1_weight",
+                    shared.fc1_weight,
+                    (1, shared_hidden // 2, shared_gateup),
+                    _DataDtype,
+                ),
+                (
+                    "fc1_output",
+                    shared.fc1_output,
+                    (buf_tokens, shared_down // 2),
+                    _DataDtype,
+                ),
+                (
+                    "fc2_weight",
+                    shared.fc2_weight,
+                    (1, shared_down // 2, shared_hidden),
+                    _DataDtype,
+                ),
+                (
+                    "output_activation",
+                    shared.output_activation,
+                    (buf_tokens, shared_hidden),
+                    torch.bfloat16,
+                ),
+            )
+            for name, tensor, shape, dtype in shared_shapes:
+                _require_cuda(f"shared.{name}", tensor)
+                if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                    raise ValueError(
+                        f"shared.{name} must have shape {shape} and dtype "
+                        f"{dtype}, got {tuple(tensor.shape)} and {tensor.dtype}."
+                    )
+            for name, tensor, minimum_rows, minimum_cols in (
+                (
+                    "activation_sf",
+                    shared.activation_sf,
+                    round_up(buf_tokens, SfPaddingBlock),
+                    (shared_hidden + Nvfp4BlockSize - 1) // Nvfp4BlockSize,
+                ),
+                (
+                    "fc1_output_sf",
+                    shared.fc1_output_sf,
+                    round_up(buf_tokens, SfPaddingBlock),
+                    (shared_down + Nvfp4BlockSize - 1) // Nvfp4BlockSize,
+                ),
+            ):
+                _require_cuda(f"shared.{name}", tensor)
+                if (
+                    tensor.dtype != _ScaleDtype
+                    or tensor.shape[0] < minimum_rows
+                    or tensor.shape[1] < minimum_cols
+                    or tensor.shape[1] % 4
+                ):
+                    raise ValueError(f"invalid shared.{name} tensor.")
+            for name, tensor in (
+                ("fc1_weight_sf", shared.fc1_weight_sf),
+                ("fc2_weight_sf", shared.fc2_weight_sf),
+            ):
+                _require_cuda(f"shared.{name}", tensor)
+                if tensor.ndim != 2 or tensor.shape[0] != 1:
+                    raise ValueError(f"shared.{name} must have one expert row.")
+            for name, tensor in (
+                ("fc1_alpha", shared.fc1_alpha),
+                ("fc2_alpha", shared.fc2_alpha),
+                ("fc1_norm_const", shared.fc1_norm_const),
+            ):
+                _require_cuda(f"shared.{name}", tensor)
+                if tensor.shape != (1,) or tensor.dtype != torch.float32:
+                    raise ValueError(f"shared.{name} must be float32 with shape (1,).")
+            _require_cuda("shared.fc1_done_counter", shared.fc1_done_counter)
+            if (
+                shared.fc1_done_counter.ndim != 1
+                or shared.fc1_done_counter.dtype != torch.int32
+            ):
+                raise ValueError("shared.fc1_done_counter must be a 1-D int32 tensor.")
+
     @staticmethod
     def _to_cute(
         tensor: torch.Tensor,
@@ -897,7 +1043,7 @@ class MegaMoENvfp4Frontend:
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
-        return dict(
+        kwargs = dict(
             activation=self._to_cute(inputs.activation),
             activation_sf=self._to_cute(inputs.activation_sf),
             topk_idx=self._to_cute(inputs.topk_idx),
@@ -926,6 +1072,36 @@ class MegaMoENvfp4Frontend:
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
         )
+        shared = inputs.shared
+        shared_names = (
+            "activation",
+            "activation_sf",
+            "fc1_weight",
+            "fc1_weight_sf",
+            "fc1_output",
+            "fc1_output_sf",
+            "fc2_weight",
+            "fc2_weight_sf",
+            "fc1_alpha",
+            "fc2_alpha",
+            "fc1_norm_const",
+            "fc1_done_counter",
+            "output_activation",
+        )
+        for name in shared_names:
+            tensor = getattr(shared, name) if shared is not None else None
+            assumed_align = 4 if name in {
+                "fc1_alpha",
+                "fc2_alpha",
+                "fc1_norm_const",
+                "fc1_done_counter",
+            } else 16
+            kwargs[f"shared_{name}"] = (
+                self._to_cute(tensor, assumed_align=assumed_align)
+                if tensor is not None
+                else None
+            )
+        return kwargs
 
     @staticmethod
     def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 16):
