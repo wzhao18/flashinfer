@@ -2191,12 +2191,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
 
             if cutlass.const_expr(shared_tma is not None):
-                shared_tile_idx = cutlass.Int32(bidz)
-                shared_tile_count = (
+                shared_fc1_tile_count = (
                     scheduler._num_shared_token_blocks
                     * scheduler._num_shared_fc1_blocks
                 )
-                while shared_tile_idx < shared_tile_count:
+                shared_tile_idx = cutlass.Int32(bidz)
+                while shared_tile_idx < shared_fc1_tile_count:
                     scheduler.gen_shared_work(shared_tile_idx)
                     ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                     scheduler.publish_work()
@@ -2223,6 +2223,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                 scheduler.publish_work()
                 scheduler.gen_next_work()
+            if cutlass.const_expr(shared_tma is not None):
+                shared_tile_idx = shared_fc1_tile_count + cutlass.Int32(bidz)
+                shared_tile_count = (
+                    shared_fc1_tile_count
+                    + scheduler._num_shared_token_blocks
+                    * scheduler._num_shared_fc2_blocks
+                )
+                while shared_tile_idx < shared_tile_count:
+                    scheduler.gen_shared_work(shared_tile_idx)
+                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                    scheduler.publish_work()
+                    shared_tile_idx += scheduler.num_persistent_clusters
+                scheduler.gen_shared_work(shared_tile_count)
             # Sentinel publish (current_work is already invalid here).
             scheduler.publish_work()
             scheduler.produce_tail()
@@ -2462,7 +2475,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
-            ab_producer.tail()
+            # Shared tasks reset the producer per tile; MMA tail is the drain.
+            if cutlass.const_expr(shared_tma is None):
+                ab_producer.tail()
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
@@ -2511,11 +2526,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             ) // self.cta_tile_shape_mnk[0]
             shared_fc2_spin_threshold = fc2_spin_threshold
             if cutlass.const_expr(shared_tma is not None):
-                shared_fc2_spin_threshold = (
-                    self.shared_intermediate
-                    + self.cta_tile_shape_mnk[0]
-                    - 1
-                ) // self.cta_tile_shape_mnk[0]
+                shared_fc2_spin_threshold = scheduler._num_shared_fc1_blocks
 
             work_tile_info = sched_consumer.consume_work()
 
@@ -2825,7 +2836,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
-            ab_producer.tail()
+            # Shared tasks reset the producer per tile; MMA tail is the drain.
+            if cutlass.const_expr(shared_tma is None):
+                ab_producer.tail()
 
         # ════════════════════════════════════════════════════════════════════
         # MMA warp (warp 4)
