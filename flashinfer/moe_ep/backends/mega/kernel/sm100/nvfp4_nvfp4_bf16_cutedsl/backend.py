@@ -318,7 +318,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
         shared_identity = (
-            tuple(t.data_ptr() for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
+            tuple((t.data_ptr(), tuple(t.shape)) for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
             if shared_inputs is not None else ()
         )
         weight_identity = tuple(

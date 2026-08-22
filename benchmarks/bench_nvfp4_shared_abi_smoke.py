@@ -382,6 +382,30 @@ def main() -> None:
     torch.testing.assert_close(shared.output_activation, reference)
     print("backend fused launch and correctness passed")
 
+    def active_shared_inputs(num_tokens: int) -> MegaMoESharedNvfp4Inputs:
+        return dataclasses.replace(
+            shared,
+            activation=shared.activation[:num_tokens],
+            fc1_output=shared.fc1_output[:num_tokens],
+            fc1_done_counter=shared.fc1_done_counter[:num_tokens],
+            output_activation=shared.output_activation[:num_tokens],
+        )
+
+    backend._thunk_state = None
+    for active_tokens in (17, tokens):
+        routed._mega_shared_inputs = active_shared_inputs(active_tokens)
+        shared.output_activation.zero_()
+        backend.compute(
+            routed,
+            (routed_fc1, routed_fc2),
+            output=backend_output[:active_tokens],
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            shared.output_activation[:active_tokens], reference[:active_tokens]
+        )
+    print("backend mixed active-shape thunk reuse passed")
+
     routed_only_frontend = MegaMoENvfp4Frontend(
         dataclasses.replace(
             routed._frontend.config,
