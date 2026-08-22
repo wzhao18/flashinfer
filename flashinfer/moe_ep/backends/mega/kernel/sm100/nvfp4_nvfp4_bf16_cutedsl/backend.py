@@ -33,9 +33,6 @@ from .weights import (
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
-_MAX_INTEGRATED_SHARED_FC2_TOKENS = 128
-
-
 
 def _resolve_gate_up_clamp(
     config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -342,19 +339,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         _, thunk, out_buf = state
         thunk()
-        shared = shared_inputs
-        if shared is not None and num_tokens > _MAX_INTEGRATED_SHARED_FC2_TOKENS:
-            from flashinfer import mm_fp4
-
-            mm_fp4(
-                shared.fc1_output.view(torch.uint8),
-                shared.fc2_weight[0].view(torch.uint8),
-                shared.fc1_output_sf,
-                shared.fc2_weight_sf[0],
-                alpha=shared.fc2_alpha,
-                out=shared.output_activation,
-                backend="cute-dsl",
-            )
         if output is not None:
             output.copy_(out_buf[:num_tokens])
             return output

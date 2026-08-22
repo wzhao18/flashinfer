@@ -2185,10 +2185,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             k_tile_cnt_shared_fc2 = (
                 self.shared_intermediate // 2 + mma_tiler_k - 1
             ) // mma_tiler_k
-            shared_fc2_enabled = (
-                shared_tma_tensor_activation.shape[0]
-                <= self.cta_tile_shape_mnk[0]
-            )
+            shared_fc2_enabled = True
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (warp 7)
