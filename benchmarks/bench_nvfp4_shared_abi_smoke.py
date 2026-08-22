@@ -244,15 +244,6 @@ def main() -> None:
     thunk = routed._frontend.make_launch_thunk(inputs)
     print("integrated thunk compiled", flush=True)
     thunk()
-    mm_fp4(
-        shared.fc1_output.view(torch.uint8),
-        shared.fc2_weight[0].view(torch.uint8),
-        shared.fc1_output_sf,
-        shared.fc2_weight_sf[0],
-        alpha=shared.fc2_alpha,
-        out=shared.output_activation,
-        backend="cute-dsl",
-    )
     torch.cuda.synchronize()
     print(
         "integrated fc2/reference max diff=",
@@ -273,15 +264,6 @@ def main() -> None:
                 graph_thunk()
         for _ in range(graph_replays):
             graph.replay()
-        mm_fp4(
-            shared.fc1_output.view(torch.uint8),
-            shared.fc2_weight[0].view(torch.uint8),
-            shared.fc1_output_sf,
-            shared.fc2_weight_sf[0],
-            alpha=shared.fc2_alpha,
-            out=shared.output_activation,
-            backend="cute-dsl",
-        )
         torch.cuda.synchronize()
         torch.testing.assert_close(shared.output_activation, reference)
         print(
@@ -396,15 +378,6 @@ def main() -> None:
         (routed_fc1, routed_fc2),
         output=backend_output,
     )
-    mm_fp4(
-        shared.fc1_output.view(torch.uint8),
-        shared.fc2_weight[0].view(torch.uint8),
-        shared.fc1_output_sf,
-        shared.fc2_weight_sf[0],
-        alpha=shared.fc2_alpha,
-        out=shared.output_activation,
-        backend="cute-dsl",
-    )
     torch.cuda.synchronize()
     torch.testing.assert_close(shared.output_activation, reference)
     print("backend fused launch and correctness passed")
@@ -456,6 +429,7 @@ def main() -> None:
         "routed_only": bench_ms(routed_only_thunk),
         "shared_standalone": bench_ms(reference_thunk),
         "sequential_baseline": bench_ms(sequential_baseline),
+        "routed_plus_fused_shared_fc12": bench_ms(thunk),
         "routed_plus_shared_fc1_dense_fc2": bench_ms(integrated_split_fc2),
         "dense_shared_fc2": bench_ms(dense_fc2),
     }

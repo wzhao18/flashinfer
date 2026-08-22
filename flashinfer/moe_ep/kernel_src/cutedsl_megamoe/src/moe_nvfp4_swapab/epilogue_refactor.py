@@ -1197,7 +1197,6 @@ class SwapABSwigluFp4Epilogue:
                 shared_fc1_output_sf,
                 shared_fc1_done_counter,
                 shared_optional_epi_args,
-                publish_fc1_done=False,
             )
             shared_fc2_epi = SwapABFc2Epilogue(
                 shared_base,
@@ -1362,7 +1361,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: NvFp4OptinalEpiArgs,
-        publish_fc1_done: bool = True,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -1385,7 +1383,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         self.fc1_output_sf = fc1_output_sf
         self.fc1_done_counter = fc1_done_counter
         self.optional_epi_args = optional_epi_args
-        self.publish_fc1_done = publish_fc1_done
         self._freeze()
 
     def __getattr__(self, name):
@@ -1405,14 +1402,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
-        if cutlass.const_expr(not self.publish_fc1_done):
-            return flag_tracker.accumulate(
-                next_work_tile_info.phase,
-                1,
-                Int64(0),
-                no_fire=True,
-            )
-
         # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
         if cutlass.const_expr(
             self.static_expert_shape is None
