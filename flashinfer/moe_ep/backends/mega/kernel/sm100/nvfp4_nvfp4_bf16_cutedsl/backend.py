@@ -279,13 +279,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/clamp change nulls the frontend's compiled session,
         # changing the key and forcing a rebuild through the validated path.
-        fe = workspace._frontend
+        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
+        fe = workspace.frontend_for_shared_inputs(shared_inputs)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
-        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
         # IKR writes only epilogue tiles that cover live rows. Clear the same
         # 64-row extent instead of the capacity-sized output workspace.
         clear_tokens = min(

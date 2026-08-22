@@ -652,12 +652,15 @@ def _run_mega_layer(
                 fc2_alpha=problem["fc2_alpha"],
                 fc1_norm_const=problem["fc1_norm_const"],
             )
+        layer_shared_inputs = shared_inputs
+        if os.environ.get("SHARED_TEST_ROUTED_ONLY_FRONTEND") == "1":
+            layer_shared_inputs = None
         t = MoEEpTensors(
             hidden_states=t_hidden,
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
             scales=t_scales,
-            mega_shared_inputs=shared_inputs,
+            mega_shared_inputs=layer_shared_inputs,
             **tensor_kwargs,
         )
         print(
@@ -668,7 +671,7 @@ def _run_mega_layer(
         y_layer = mega.forward(t).clone()
         print(f"rank {rank}: MegaMoE forward complete", flush=True)
         shared_actual = None
-        if shared_inputs is not None:
+        if layer_shared_inputs is not None:
             shared_actual = shared_inputs.output_activation[
                 : problem["num_tokens"]
             ].clone()
@@ -773,6 +776,25 @@ def _run_mega_layer(
         else:
             torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
             torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
+
+        if layer_shared_inputs is not None:
+            routed_only_t = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                **tensor_kwargs,
+            )
+            y_routed_only = mega.forward(routed_only_t)
+            torch.cuda.synchronize()
+            if in_kernel_fc2_reduce:
+                _assert_ikr_close(
+                    y_routed_only, y_ref, topk=problem["topk"]
+                )
+            else:
+                torch.testing.assert_close(
+                    y_routed_only, y_ref, atol=0.0, rtol=0.0
+                )
 
         if combine_dtype != "bf16":
             # Numerics sanity vs the exact bf16 combine wire: the quantized

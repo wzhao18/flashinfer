@@ -1248,14 +1248,32 @@ class MegaMoESymmBuffer:
     fc1_norm_const: torch.Tensor
 
     _frontend: MegaMoENvfp4Frontend
+    _routed_frontend: Optional[MegaMoENvfp4Frontend] = None
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+
+    def frontend_for_shared_inputs(
+        self, shared_inputs: Optional[MegaMoESharedNvfp4Inputs]
+    ) -> MegaMoENvfp4Frontend:
+        if shared_inputs is not None or self._frontend.config.shared_hidden is None:
+            return self._frontend
+        if self._routed_frontend is None:
+            ensure_not_capturing("routed-only MegaMoE frontend creation")
+            config = dataclasses.replace(
+                self._frontend.config,
+                shared_hidden=None,
+                shared_intermediate=None,
+            )
+            self._routed_frontend = MegaMoENvfp4Frontend(config)
+        return self._routed_frontend
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
             return
         self._frontend.release()
+        if self._routed_frontend is not None:
+            self._routed_frontend.release()
         for root in self._sym_roots:
             free_sym_tensor(root)
         self._sym_roots.clear()
