@@ -2175,6 +2175,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         k_tile_cnt_fc2 = (fc2_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
         k_tile_cnt_shared_fc1 = cutlass.Int32(0)
         k_tile_cnt_shared_fc2 = cutlass.Int32(0)
+        shared_fc2_enabled = False
         if cutlass.const_expr(shared_tma is not None):
             k_tile_cnt_shared_fc1 = (
                 self.shared_hidden + mma_tiler_k - 1
@@ -2182,10 +2183,15 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             k_tile_cnt_shared_fc2 = (
                 self.shared_intermediate // 2 + mma_tiler_k - 1
             ) // mma_tiler_k
+            shared_fc2_enabled = (
+                shared_tma_tensor_activation.shape[0]
+                <= self.cta_tile_shape_mnk[0]
+            )
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (warp 7)
         # ════════════════════════════════════════════════════════════════════
+        shared_fc1_tile_count = cutlass.Int32(0)
         if warp_idx == self.sched_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
@@ -2224,18 +2230,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 scheduler.publish_work()
                 scheduler.gen_next_work()
             if cutlass.const_expr(shared_tma is not None):
-                shared_tile_idx = shared_fc1_tile_count + cutlass.Int32(bidz)
-                shared_tile_count = (
-                    shared_fc1_tile_count
-                    + scheduler._num_shared_token_blocks
-                    * scheduler._num_shared_fc2_blocks
-                )
-                while shared_tile_idx < shared_tile_count:
-                    scheduler.gen_shared_work(shared_tile_idx)
-                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
-                    scheduler.publish_work()
-                    shared_tile_idx += scheduler.num_persistent_clusters
-                scheduler.gen_shared_work(shared_tile_count)
+                if shared_fc2_enabled:
+                    shared_tile_idx = shared_fc1_tile_count + cutlass.Int32(bidz)
+                    shared_tile_count = (
+                        shared_fc1_tile_count
+                        + scheduler._num_shared_token_blocks
+                        * scheduler._num_shared_fc2_blocks
+                    )
+                    while shared_tile_idx < shared_tile_count:
+                        scheduler.gen_shared_work(shared_tile_idx)
+                        ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                        scheduler.publish_work()
+                        shared_tile_idx += scheduler.num_persistent_clusters
+                    scheduler.gen_shared_work(shared_tile_count)
             # Sentinel publish (current_work is already invalid here).
             scheduler.publish_work()
             scheduler.produce_tail()
