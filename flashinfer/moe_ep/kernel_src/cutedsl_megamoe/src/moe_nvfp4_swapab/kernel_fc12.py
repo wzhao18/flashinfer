@@ -3191,14 +3191,3 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             lane_idx=lane_idx,
             tidx=tidx,
         )
-        if cutlass.const_expr(shared_tma is not None):
-            if bidx == 0 and bidz == 0 and tidx == 0:
-                shared_counter_slots = (
-                    sched_params.shared_shape[0]
-                    + self.cta_tile_shape_mnk[1]
-                    - 1
-                ) // self.cta_tile_shape_mnk[1]
-                for slot in cutlass.range(
-                    0, shared_counter_slots, 1, unroll=1
-                ):
-                    shared_fc1_done_counter[slot] = cutlass.Int32(0)

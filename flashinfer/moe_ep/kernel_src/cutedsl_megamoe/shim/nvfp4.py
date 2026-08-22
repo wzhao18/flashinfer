@@ -395,6 +395,8 @@ class MegaMoENvfp4Frontend:
         if reset_counters:
             self._reset_workspaces(mega)
 
+        if inputs.shared is not None:
+            inputs.shared.fc1_done_counter.zero_()
         if self.config.fc2_reduces_topk:
             # ikr accumulate-from-zero contract: output_activation is the
             # cross-rank REDG atomic-add target, so it must be zeroed before
@@ -419,8 +421,7 @@ class MegaMoENvfp4Frontend:
 
         Steady-state fast path for timing loops and tuners, mirroring the
         kernel tester's ``launch_plan`` contract: no per-call Python arg
-        rebuild, no workspace reset (the kernel tail-cleans its own
-        counters/flags), no sync.  Output lands in
+        rebuild, no general workspace reset, no sync. Output lands in
         ``inputs.output_activation``.  Invalid after the compile cache is
         invalidated (knobs/clamp change) or the buffers are freed.
 
@@ -436,6 +437,11 @@ class MegaMoENvfp4Frontend:
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
+        shared_fc1_done_counter = (
+            launch_inputs.shared.fc1_done_counter
+            if launch_inputs.shared is not None
+            else None
+        )
 
         if self.config.fc2_reduces_topk:
             output_activation = launch_inputs.output_activation
@@ -452,6 +458,8 @@ class MegaMoENvfp4Frontend:
                 output_activation = inputs.output_activation[:zero_num_tokens]
 
             def thunk() -> None:
+                if shared_fc1_done_counter is not None:
+                    shared_fc1_done_counter.zero_()
                 output_activation.zero_()
                 # The kernel's opening cross-rank dispatch barrier orders
                 # every stream-local clear before any peer REDG store.
@@ -460,6 +468,8 @@ class MegaMoENvfp4Frontend:
         else:
 
             def thunk() -> None:
+                if shared_fc1_done_counter is not None:
+                    shared_fc1_done_counter.zero_()
                 compiled(**runtime_kwargs)
 
         return thunk
