@@ -43,6 +43,8 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    shared_hidden_size: int | None = None
+    shared_intermediate_size: int | None = None
     # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
@@ -52,6 +54,19 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     knobs: dict | str | None = None
 
     def __post_init__(self) -> None:
+        if (self.shared_hidden_size is None) != (
+            self.shared_intermediate_size is None
+        ):
+            raise ValueError(
+                "shared_hidden_size and shared_intermediate_size must be "
+                "set together."
+            )
+        if self.shared_hidden_size is not None:
+            assert self.shared_intermediate_size is not None
+            if self.shared_hidden_size % 64 or self.shared_intermediate_size % 64:
+                raise ValueError(
+                    "shared expert dimensions must be multiples of 64."
+                )
         if self.activation not in ("swiglu", "situ"):
             raise ValueError(
                 f"activation must be 'swiglu' or 'situ', got {self.activation!r}."

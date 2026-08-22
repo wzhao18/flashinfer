@@ -919,8 +919,19 @@ class MegaMoENvfp4Frontend:
             shared_gateup = c.shared_intermediate
             assert shared_hidden is not None and shared_gateup is not None
             shared_down = shared_gateup // 2
+            shared_tokens = shared.activation.shape[0]
+            if shared_tokens < 1 or shared_tokens > buf_tokens:
+                raise ValueError(
+                    "shared activation capacity must be positive and not "
+                    "exceed the routed activation capacity."
+                )
             shared_shapes = (
-                ("activation", shared.activation, (buf_tokens, shared_hidden // 2), _DataDtype),
+                (
+                    "activation",
+                    shared.activation,
+                    (shared_tokens, shared_hidden // 2),
+                    _DataDtype,
+                ),
                 (
                     "fc1_weight",
                     shared.fc1_weight,
@@ -930,7 +941,7 @@ class MegaMoENvfp4Frontend:
                 (
                     "fc1_output",
                     shared.fc1_output,
-                    (buf_tokens, shared_down // 2),
+                    (shared_tokens, shared_down // 2),
                     _DataDtype,
                 ),
                 (
@@ -942,7 +953,7 @@ class MegaMoENvfp4Frontend:
                 (
                     "output_activation",
                     shared.output_activation,
-                    (buf_tokens, shared_hidden),
+                    (shared_tokens, shared_hidden),
                     torch.bfloat16,
                 ),
             )
@@ -957,13 +968,13 @@ class MegaMoENvfp4Frontend:
                 (
                     "activation_sf",
                     shared.activation_sf,
-                    round_up(buf_tokens, SfPaddingBlock),
+                    round_up(shared_tokens, SfPaddingBlock),
                     (shared_hidden + Nvfp4BlockSize - 1) // Nvfp4BlockSize,
                 ),
                 (
                     "fc1_output_sf",
                     shared.fc1_output_sf,
-                    round_up(buf_tokens, SfPaddingBlock),
+                    round_up(shared_tokens, SfPaddingBlock),
                     (shared_down + Nvfp4BlockSize - 1) // Nvfp4BlockSize,
                 ),
             ):
@@ -994,8 +1005,12 @@ class MegaMoENvfp4Frontend:
             if (
                 shared.fc1_done_counter.ndim != 1
                 or shared.fc1_done_counter.dtype != torch.int32
+                or shared.fc1_done_counter.numel() < shared_tokens
             ):
-                raise ValueError("shared.fc1_done_counter must be a 1-D int32 tensor.")
+                raise ValueError(
+                    "shared.fc1_done_counter must be a 1-D int32 tensor with "
+                    "at least one slot per shared token."
+                )
 
     @staticmethod
     def _to_cute(
@@ -1273,6 +1288,8 @@ def get_symm_buffer_for_mega_moe(
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
     local_only: bool = False,
+    shared_hidden: Optional[int] = None,
+    shared_intermediate: Optional[int] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1373,6 +1390,8 @@ def get_symm_buffer_for_mega_moe(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
         local_only=local_only,
+        shared_hidden=shared_hidden,
+        shared_intermediate=shared_intermediate,
     )
     cfg = with_knobs(cfg, resolved_knobs)
     if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:

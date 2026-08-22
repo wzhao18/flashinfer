@@ -1437,6 +1437,24 @@ def test_nvfp4_cutedsl_config_validates_situ():
         )
 
 
+def test_nvfp4_cutedsl_config_validates_shared_expert_shape():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=16,
+        shared_hidden_size=7168,
+        shared_intermediate_size=6144,
+    )
+    assert cfg.shared_hidden_size == 7168
+    with pytest.raises(ValueError, match="must be set together"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=3072,
+            top_k=16,
+            shared_hidden_size=7168,
+        )
+
+
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         MegaMoENvfp4Config,

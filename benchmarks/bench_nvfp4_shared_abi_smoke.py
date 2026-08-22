@@ -104,7 +104,7 @@ def main() -> None:
         fc1_alpha=shared_buffer.fc1_alpha,
         fc2_alpha=shared_buffer.fc2_alpha,
         fc1_norm_const=shared_buffer.fc1_norm_const,
-        fc1_done_counter=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        fc1_done_counter=torch.zeros(tokens, dtype=torch.int32, device="cuda"),
         output_activation=shared_buffer.output_activation,
     )
     routed._frontend = MegaMoENvfp4Frontend(
@@ -318,6 +318,38 @@ def main() -> None:
     )
     torch.testing.assert_close(shared.output_activation, reference)
     print("shared ABI compile, launch, and correctness passed")
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Nvfp4CutedslMegaKernelBackend,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    backend = Nvfp4CutedslMegaKernelBackend(
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=intermediate,
+            top_k=routed_topk,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            shared_hidden_size=shared_hidden,
+            shared_intermediate_size=shared_down,
+        )
+    )
+    routed._mega_shared_inputs = shared
+    backend_output = torch.empty(
+        tokens, routed_hidden, dtype=torch.bfloat16, device="cuda"
+    )
+    shared.output_activation.zero_()
+    backend.compute(
+        routed,
+        (routed_fc1, routed_fc2),
+        output=backend_output,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(shared.output_activation, reference)
+    print("backend split launch and correctness passed")
 
     routed_only_frontend = MegaMoENvfp4Frontend(
         dataclasses.replace(

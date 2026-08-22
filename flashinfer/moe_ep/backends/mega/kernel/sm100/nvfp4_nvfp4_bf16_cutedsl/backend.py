@@ -143,6 +143,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            shared_hidden=k.shared_hidden_size,
+            shared_intermediate=(
+                2 * k.shared_intermediate_size
+                if k.shared_intermediate_size is not None
+                else None
+            ),
         )
 
     def validate_forward(
@@ -218,6 +224,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.fc2_alpha.copy_(t.fc2_alpha)
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+        workspace._mega_shared_inputs = t.mega_shared_inputs
 
     def compute(
         self,
@@ -278,6 +285,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
+        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
         # IKR writes only epilogue tiles that cover live rows. Clear the same
         # 64-row extent instead of the capacity-sized output workspace.
         clear_tokens = min(
@@ -290,6 +298,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             id(mega.compiled) if mega is not None and mega.compiled else None,
             stream,
             clear_tokens,
+            tuple(
+                tensor.data_ptr()
+                for tensor in vars(shared_inputs).values()
+                if isinstance(tensor, torch.Tensor)
+            )
+            if shared_inputs is not None
+            else (),
         )
         state = self._thunk_state
         if state is None or state[0] != key or key[2] is None:
@@ -310,6 +325,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 fc2_alpha=workspace.fc2_alpha,
                 fc1_norm_const=workspace.fc1_norm_const,
                 output_activation=workspace.output_activation,
+                shared=shared_inputs,
             )
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
@@ -317,12 +333,25 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 inputs, zero_num_tokens=clear_tokens
             )
             mega = fe._mega
-            key = (key[0], key[1], id(mega.compiled), stream, clear_tokens)
+            key = (*key[:2], id(mega.compiled), *key[3:])
             state = (key, thunk, workspace.output_activation)
             self._thunk_state = state
 
         _, thunk, out_buf = state
         thunk()
+        shared = shared_inputs
+        if shared is not None:
+            from flashinfer import mm_fp4
+
+            mm_fp4(
+                shared.fc1_output.view(torch.uint8),
+                shared.fc2_weight[0].view(torch.uint8),
+                shared.fc1_output_sf,
+                shared.fc2_weight_sf[0],
+                alpha=shared.fc2_alpha,
+                out=shared.output_activation,
+                backend="cute-dsl",
+            )
         if output is not None:
             output.copy_(out_buf[:num_tokens])
             return output
@@ -359,6 +388,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.apply_topk_in_fc1,
             k.in_kernel_fc2_reduce,
             k.combine_dtype,
+            k.shared_hidden_size,
+            k.shared_intermediate_size,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
