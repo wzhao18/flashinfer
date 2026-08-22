@@ -243,6 +243,13 @@ def main() -> None:
     thunk = routed._frontend.make_launch_thunk(inputs)
     print("integrated thunk compiled", flush=True)
     thunk()
+    torch.cuda.synchronize()
+    print(
+        "integrated fc2/reference max diff=",
+        (shared.output_activation.float() - reference.float()).abs().max().item(),
+        flush=True,
+    )
+    torch.testing.assert_close(shared.output_activation, reference)
     raw_fc1_sf = from_blocked(
         shared.fc1_output_sf.flatten(), tokens, shared_down // 16
     ).float()
@@ -373,10 +380,6 @@ def main() -> None:
             backend="cute-dsl",
         )
 
-    def integrated_split() -> None:
-        thunk()
-        dense_fc2()
-
     def sequential_baseline() -> None:
         routed_only_thunk()
         reference_thunk()
@@ -398,9 +401,8 @@ def main() -> None:
         "routed_only": bench_ms(routed_only_thunk),
         "shared_standalone": bench_ms(reference_thunk),
         "sequential_baseline": bench_ms(sequential_baseline),
-        "routed_plus_shared_fc1": bench_ms(thunk),
+        "routed_plus_shared_fc12": bench_ms(thunk),
         "dense_shared_fc2": bench_ms(dense_fc2),
-        "integrated_split": bench_ms(integrated_split),
     }
     print("timings_ms", timings, flush=True)
 
