@@ -21,7 +21,7 @@ exists in the kernel but is not wired here.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import torch
 
@@ -119,6 +119,7 @@ def fused_quant_stage(
     *,
     quant_type: str,
     norm_const: Optional[float] = None,
+    sf_layout: Literal["row_major", "blocked_128x4"] = "row_major",
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -136,6 +137,10 @@ def fused_quant_stage(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
     is_nvfp4 = quant_type == "nvfp4"
+    if sf_layout not in ("row_major", "blocked_128x4"):
+        raise ValueError(f"unsupported sf_layout: {sf_layout!r}")
+    if sf_layout == "blocked_128x4" and not is_nvfp4:
+        raise ValueError("blocked_128x4 staging currently requires nvfp4")
     if is_nvfp4 and norm_const is None:
         raise ValueError("nvfp4 staging requires an offline norm_const")
     if not is_nvfp4 and norm_const is not None:
@@ -171,15 +176,27 @@ def fused_quant_stage(
             f"x_sf trailing dim ({x_sf_out.shape[1]}) must be {n_blocks} "
             f"for hidden={hidden}, {quant_type}."
         )
+    if sf_layout == "blocked_128x4" and (
+        x_sf_out.shape[0] < ((num_tokens + 127) // 128) * 128
+        or x_sf_out.shape[0] % 128
+    ):
+        raise ValueError(
+            "blocked_128x4 x_sf must provide a 128-row-padded physical plane"
+        )
 
-    key = (topk, hidden, quant_type)
+    key = (topk, hidden, quant_type, sf_layout)
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
         from src.inputs_process import DataPreprocess
 
         stager = _CompiledStager(
-            dp=DataPreprocess(topk=topk, hidden=hidden, quant_type=quant_type)
+            dp=DataPreprocess(
+                topk=topk,
+                hidden=hidden,
+                quant_type=quant_type,
+                sf_layout=sf_layout,
+            )
         )
         _STAGERS[key] = stager
 
@@ -196,6 +213,7 @@ def fused_quant_stage(
         topk_weights_out.data_ptr(),
         num_tokens,
         norm_const,
+        sf_layout,
         stream,
     )
     if stager.compiled is None or stager.launch_key != launch_key:
@@ -207,7 +225,10 @@ def fused_quant_stage(
             _to_cute(topk_weights, 4),
             None,  # token_padding_info: only live rows are launched
             _to_cute(x_out[:num_tokens], 16),
-            _to_cute(x_sf_out[:num_tokens], 4),
+            _to_cute(
+                x_sf_out if sf_layout == "blocked_128x4" else x_sf_out[:num_tokens],
+                4,
+            ),
             _to_cute(topk_idx_out[:num_tokens], 4),
             _to_cute(topk_weights_out[:num_tokens], 4),
             cuda_driver.CUstream(stream),
