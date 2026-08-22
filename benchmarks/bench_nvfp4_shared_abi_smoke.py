@@ -24,7 +24,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_swapab.runner_co
 
 def main() -> None:
     os.environ["MEGA_NO_DIST"] = "1"
-    tokens = 16
+    tokens = int(os.environ.get("TOKENS", 16))
     routed_capacity = int(os.environ.get("ROUTED_CAPACITY", tokens))
     intermediate = 3072
     match_outer_dims = os.environ.get("MATCH_OUTER_DIMS") == "1"
@@ -243,6 +243,16 @@ def main() -> None:
     thunk = routed._frontend.make_launch_thunk(inputs)
     print("integrated thunk compiled", flush=True)
     thunk()
+    if tokens > 256:
+        mm_fp4(
+            shared.fc1_output.view(torch.uint8),
+            shared.fc2_weight[0].view(torch.uint8),
+            shared.fc1_output_sf,
+            shared.fc2_weight_sf[0],
+            alpha=shared.fc2_alpha,
+            out=shared.output_activation,
+            backend="cute-dsl",
+        )
     torch.cuda.synchronize()
     print(
         "integrated fc2/reference max diff=",
