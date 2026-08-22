@@ -146,6 +146,54 @@ def test_fused_stage_bit_matches_torch_stage(monkeypatch, quant_type, num_tokens
 
 
 @pytest.mark.arch_blackwell
+def test_fused_nvfp4_stage_writes_blocked_scale_layout():
+    """Blocked staging must match the canonical 128x4 scale transform."""
+    import torch
+
+    _require_blackwell()
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fused_quant_stage
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_swapab.runner_common import (
+        to_blocked,
+    )
+
+    num_tokens, hidden, topk, num_experts = 16, 2048, 4, 16
+    batch = _make_batch(num_tokens, hidden, topk, num_experts, seed=29)
+    hidden_states, topk_ids, topk_weights = batch
+    row_major = _make_buffers("nvfp4", num_tokens, hidden, topk)
+    blocked = _make_buffers("nvfp4", num_tokens, hidden, topk)
+    blocked_sf = torch.zeros(
+        128, hidden // 16, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    blocked = (blocked[0], blocked_sf, blocked[2], blocked[3])
+
+    fused_quant_stage(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        *row_major,
+        quant_type="nvfp4",
+        norm_const=2.0,
+    )
+    fused_quant_stage(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        *blocked,
+        quant_type="nvfp4",
+        norm_const=2.0,
+        sf_layout="blocked_128x4",
+    )
+    torch.cuda.synchronize()
+
+    expected_sf = to_blocked(row_major[1]).view(torch.uint8)
+    assert torch.equal(blocked[1].view(torch.uint8).flatten(), expected_sf)
+    assert torch.equal(blocked[0].view(torch.uint8), row_major[0].view(torch.uint8))
+    assert torch.equal(blocked[2], row_major[2])
+    assert torch.equal(blocked[3], row_major[3])
+
+
+@pytest.mark.arch_blackwell
 def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
     """Cache-hit relaunch (new data, same ptrs) and cache-rebuild (new n)."""
     import torch

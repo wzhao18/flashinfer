@@ -29,6 +29,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Float32, Int32, Int64
+from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from common.megamoe_constants import (
     Fp8E4M3FNMax,
@@ -58,7 +59,13 @@ class DataPreprocess:
     _amax_threads_per_cta: int = 128
     _amax_load_vec: int = 8  # 8 bf16 = 16 B per load
 
-    def __init__(self, topk: int, hidden: int, quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"]) -> None:
+    def __init__(
+        self,
+        topk: int,
+        hidden: int,
+        quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"],
+        sf_layout: Literal["row_major", "blocked_128x4"] = "row_major",
+    ) -> None:
         self.topk = int(topk)
         # The routing repack assigns one lane per topk slot, so topk cannot
         # exceed the CTA width.
@@ -72,6 +79,11 @@ class DataPreprocess:
         self.hidden = int(hidden)
         self.quant_type = quant_type
         self.is_nvfp4 = quant_type == "nvfp4"
+        self.sf_layout = sf_layout
+        if sf_layout not in ("row_major", "blocked_128x4"):
+            raise ValueError(f"Unsupported sf_layout: {sf_layout!r}")
+        if sf_layout == "blocked_128x4" and not self.is_nvfp4:
+            raise ValueError("blocked_128x4 staging currently requires nvfp4")
         if quant_type == "nvfp4":
             self.sf_vec = Nvfp4BlockSize
             self.quant_dtype = cutlass.Float4E2M1FN
@@ -155,14 +167,22 @@ class DataPreprocess:
         # block's single scale entry.
         #   (token, ceil(hidden / sf_vec)) -> (token, (sf_vec, ceil(hidden / sf_vec)))
         #                                    stride (d_token, (0, d_block))
-        num_sf_blocks = activation_sf.shape[1]
-        activation_sf = cute.make_tensor(
-            activation_sf.iterator,
-            cute.make_layout(
-                (activation_sf.shape[0], (self.sf_vec, num_sf_blocks)),
-                stride=(activation_sf.stride[0], (0, activation_sf.stride[1])),
-            ),
-        )
+        num_sf_blocks = self.hidden // self.sf_vec
+        if cutlass.const_expr(self.sf_layout == "blocked_128x4"):
+            activation_sf = cute.make_tensor(
+                activation_sf.iterator,
+                tile_atom_to_shape_SF(
+                    (activation_sf.shape[0], self.hidden, 1), self.sf_vec
+                ),
+            )
+        else:
+            activation_sf = cute.make_tensor(
+                activation_sf.iterator,
+                cute.make_layout(
+                    (activation_sf.shape[0], (self.sf_vec, num_sf_blocks)),
+                    stride=(activation_sf.stride[0], (0, activation_sf.stride[1])),
+                ),
+            )
 
         if cutlass.const_expr(not self.is_nvfp4):
             self.mxfp8_quant_and_process_impl(
@@ -407,7 +427,10 @@ class DataPreprocess:
                 fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
 
                 cute.copy(store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2))
-                activation_sf[token_idx, (0, b)] = sfc_e4m3
+                if cutlass.const_expr(self.sf_layout == "blocked_128x4"):
+                    activation_sf[token_idx, b * sf_vec, 0] = sfc_e4m3
+                else:
+                    activation_sf[token_idx, (0, b)] = sfc_e4m3
 
         self._repack_routing(
             token_idx, tid, topk_idx, topk_weights, token_padding_info, topk_idx_output, topk_weights_output
