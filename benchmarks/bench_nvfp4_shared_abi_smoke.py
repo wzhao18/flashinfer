@@ -25,6 +25,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_swapab.runner_co
 def main() -> None:
     os.environ["MEGA_NO_DIST"] = "1"
     tokens = 16
+    routed_capacity = int(os.environ.get("ROUTED_CAPACITY", tokens))
     intermediate = 3072
     match_outer_dims = os.environ.get("MATCH_OUTER_DIMS") == "1"
     routed_hidden = 7168 if match_outer_dims else 3584
@@ -35,7 +36,7 @@ def main() -> None:
         0,
         1,
         routed_experts,
-        tokens,
+        routed_capacity,
         tokens,
         routed_topk,
         routed_hidden,
@@ -317,6 +318,59 @@ def main() -> None:
     )
     torch.testing.assert_close(shared.output_activation, reference)
     print("shared ABI compile, launch, and correctness passed")
+
+    routed_only_frontend = MegaMoENvfp4Frontend(
+        dataclasses.replace(
+            routed._frontend.config,
+            shared_hidden=None,
+            shared_intermediate=None,
+        )
+    )
+    routed_only_thunk = routed_only_frontend.make_launch_thunk(
+        dataclasses.replace(inputs, shared=None)
+    )
+
+    def dense_fc2() -> None:
+        mm_fp4(
+            shared.fc1_output.view(torch.uint8),
+            shared.fc2_weight[0].view(torch.uint8),
+            shared.fc1_output_sf,
+            shared.fc2_weight_sf[0],
+            alpha=shared.fc2_alpha,
+            out=shared.output_activation,
+            backend="cute-dsl",
+        )
+
+    def integrated_split() -> None:
+        thunk()
+        dense_fc2()
+
+    def sequential_baseline() -> None:
+        routed_only_thunk()
+        reference_thunk()
+
+    def bench_ms(fn, warmup: int = 5, iterations: int = 30) -> float:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            fn()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / iterations
+
+    timings = {
+        "routed_only": bench_ms(routed_only_thunk),
+        "shared_standalone": bench_ms(reference_thunk),
+        "sequential_baseline": bench_ms(sequential_baseline),
+        "routed_plus_shared_fc1": bench_ms(thunk),
+        "dense_shared_fc2": bench_ms(dense_fc2),
+        "integrated_split": bench_ms(integrated_split),
+    }
+    print("timings_ms", timings, flush=True)
 
 
 if __name__ == "__main__":
