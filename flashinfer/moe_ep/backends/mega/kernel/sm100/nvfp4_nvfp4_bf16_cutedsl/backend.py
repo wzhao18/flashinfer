@@ -33,6 +33,8 @@ from .weights import (
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
+_MAX_INTEGRATED_SHARED_FC2_TOKENS = 128
+
 
 
 def _resolve_gate_up_clamp(
@@ -424,7 +426,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             reducer.run(partials, out_buf, num_tokens, stream)
             del workspace_root
         shared = getattr(workspace, "_mega_shared_inputs", None)
-        if shared is not None:
+        if shared is not None and num_tokens > _MAX_INTEGRATED_SHARED_FC2_TOKENS:
             from flashinfer import mm_fp4
 
             mm_fp4(
