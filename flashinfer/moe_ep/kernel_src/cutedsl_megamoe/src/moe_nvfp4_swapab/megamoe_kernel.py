@@ -186,6 +186,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         max_tokens_per_rank: int,
         hidden: int,
         fc2_output_dtype: Type[cutlass.Numeric],
+        shared_hidden: Optional[int] = None,
+        shared_intermediate: Optional[int] = None,
         combine_format: CombineFormat = CombineFormat.parse("bf16"),
         non_ubulk_fc2_store: bool = True,
         in_kernel_fc2_reduce: bool = False,
@@ -251,6 +253,13 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 f"or 'reuse_dispatch_warps'; got {token_back_mode!r}."
             )
         token_back_by_dispatch = token_back_mode != "epi_warps"
+
+        if (shared_hidden is None) != (shared_intermediate is None):
+            raise ValueError(
+                "shared_hidden and shared_intermediate must be provided together."
+            )
+        self.shared_hidden = shared_hidden
+        self.shared_intermediate = shared_intermediate
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -1106,6 +1115,19 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         fc1_alpha: cute.Tensor,
         fc2_alpha: cute.Tensor,
         fc1_norm_const: cute.Tensor,
+        shared_activation,
+        shared_activation_sf,
+        shared_fc1_weight,
+        shared_fc1_weight_sf,
+        shared_fc1_output,
+        shared_fc1_output_sf,
+        shared_fc2_weight,
+        shared_fc2_weight_sf,
+        shared_fc1_alpha,
+        shared_fc2_alpha,
+        shared_fc1_norm_const,
+        shared_fc1_done_counter,
+        shared_output_activation,
         # Final combined output the caller consumes: 2D (T, hidden).  Under
         # in_kernel_reduce it is the cross-rank REDG target (symmetric heap);
         # under separate_kernel_reduce it is the local tail-reduce destination
@@ -1476,6 +1498,19 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
             fc1_norm_const=fc1_norm_const,
+            shared_activation=shared_activation,
+            shared_activation_sf=shared_activation_sf,
+            shared_fc1_weight=shared_fc1_weight,
+            shared_fc1_weight_sf=shared_fc1_weight_sf,
+            shared_fc1_output=shared_fc1_output,
+            shared_fc1_output_sf=shared_fc1_output_sf,
+            shared_fc2_weight=shared_fc2_weight,
+            shared_fc2_weight_sf=shared_fc2_weight_sf,
+            shared_fc1_alpha=shared_fc1_alpha,
+            shared_fc2_alpha=shared_fc2_alpha,
+            shared_fc1_norm_const=shared_fc1_norm_const,
+            shared_fc1_done_counter=shared_fc1_done_counter,
+            shared_output_activation=shared_output_activation,
             offs=None,
             max_active_clusters=max_active_clusters,
             stream=stream,
