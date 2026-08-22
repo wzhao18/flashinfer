@@ -483,8 +483,12 @@ class MegaMoENvfp4Frontend:
         shared_key = ()
         if t.shared is not None:
             shared_key = tuple(
-                getattr(t.shared, field.name).data_ptr()
+                key_part
                 for field in dataclasses.fields(t.shared)
+                for key_part in (
+                    getattr(t.shared, field.name).data_ptr(),
+                    tuple(getattr(t.shared, field.name).shape),
+                )
             )
         return (
             t.activation.data_ptr(),

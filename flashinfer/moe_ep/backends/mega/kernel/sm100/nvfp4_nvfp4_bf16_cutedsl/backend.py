@@ -299,7 +299,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             stream,
             clear_tokens,
             tuple(
-                tensor.data_ptr()
+                (tensor.data_ptr(), tuple(tensor.shape))
                 for tensor in vars(shared_inputs).values()
                 if isinstance(tensor, torch.Tensor)
             )
