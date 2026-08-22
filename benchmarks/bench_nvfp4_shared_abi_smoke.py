@@ -26,6 +26,7 @@ def main() -> None:
     os.environ["MEGA_NO_DIST"] = "1"
     tokens = int(os.environ.get("TOKENS", 16))
     routed_capacity = int(os.environ.get("ROUTED_CAPACITY", tokens))
+    max_active_clusters = int(os.environ.get("MAX_ACTIVE_CLUSTERS", 60))
     intermediate = 3072
     match_outer_dims = os.environ.get("MATCH_OUTER_DIMS") == "1"
     routed_hidden = 7168 if match_outer_dims else 3584
@@ -47,7 +48,7 @@ def main() -> None:
         knobs={
             "cluster_shape_mnk": (2, 1, 1),
             "group_hint": 512,
-            "max_active_clusters": 60,
+            "max_active_clusters": max_active_clusters,
             "epi_flag_batch": (2, 4),
             "load_balance_mode": "atomic_counter",
             "mma_tiler_mnk": (256, 128, 256),
@@ -73,7 +74,7 @@ def main() -> None:
         knobs={
             "cluster_shape_mnk": (2, 1, 1),
             "group_hint": 512,
-            "max_active_clusters": 60,
+            "max_active_clusters": max_active_clusters,
             "epi_flag_batch": (2, 4),
             "load_balance_mode": "atomic_counter",
             "mma_tiler_mnk": (256, 128, 256),
@@ -243,7 +244,35 @@ def main() -> None:
     thunk = routed._frontend.make_launch_thunk(inputs)
     print("integrated thunk compiled", flush=True)
     thunk()
-    if tokens > 256:
+    mm_fp4(
+        shared.fc1_output.view(torch.uint8),
+        shared.fc2_weight[0].view(torch.uint8),
+        shared.fc1_output_sf,
+        shared.fc2_weight_sf[0],
+        alpha=shared.fc2_alpha,
+        out=shared.output_activation,
+        backend="cute-dsl",
+    )
+    torch.cuda.synchronize()
+    print(
+        "integrated fc2/reference max diff=",
+        (shared.output_activation.float() - reference.float()).abs().max().item(),
+        flush=True,
+    )
+    torch.testing.assert_close(shared.output_activation, reference)
+    graph_replays = int(os.environ.get("CUDA_GRAPH_REPLAYS", 0))
+    if graph_replays:
+        launches_per_graph = int(os.environ.get("LAUNCHES_PER_GRAPH", 1))
+        graph_stream = torch.cuda.Stream()
+        with torch.cuda.stream(graph_stream):
+            graph_thunk = routed._frontend.make_launch_thunk(inputs)
+        graph_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=graph_stream):
+            for _ in range(launches_per_graph):
+                graph_thunk()
+        for _ in range(graph_replays):
+            graph.replay()
         mm_fp4(
             shared.fc1_output.view(torch.uint8),
             shared.fc2_weight[0].view(torch.uint8),
@@ -253,13 +282,13 @@ def main() -> None:
             out=shared.output_activation,
             backend="cute-dsl",
         )
-    torch.cuda.synchronize()
-    print(
-        "integrated fc2/reference max diff=",
-        (shared.output_activation.float() - reference.float()).abs().max().item(),
-        flush=True,
-    )
-    torch.testing.assert_close(shared.output_activation, reference)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(shared.output_activation, reference)
+        print(
+            f"CUDA graph replay x{graph_replays} "
+            f"({launches_per_graph} launches/graph) passed",
+            flush=True,
+        )
     raw_fc1_sf = from_blocked(
         shared.fc1_output_sf.flatten(), tokens, shared_down // 16
     ).float()
@@ -354,6 +383,9 @@ def main() -> None:
             shared_intermediate_size=shared_down,
         )
     )
+    from flashinfer.moe_ep import BootstrapConfig
+
+    backend.bind_ep_bootstrap(BootstrapConfig(world_size=1, rank=0))
     routed._mega_shared_inputs = shared
     backend_output = torch.empty(
         tokens, routed_hidden, dtype=torch.bfloat16, device="cuda"
@@ -363,6 +395,15 @@ def main() -> None:
         routed,
         (routed_fc1, routed_fc2),
         output=backend_output,
+    )
+    mm_fp4(
+        shared.fc1_output.view(torch.uint8),
+        shared.fc2_weight[0].view(torch.uint8),
+        shared.fc1_output_sf,
+        shared.fc2_weight_sf[0],
+        alpha=shared.fc2_alpha,
+        out=shared.output_activation,
+        backend="cute-dsl",
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(shared.output_activation, reference)
@@ -394,6 +435,10 @@ def main() -> None:
         routed_only_thunk()
         reference_thunk()
 
+    def integrated_split_fc2() -> None:
+        thunk()
+        dense_fc2()
+
     def bench_ms(fn, warmup: int = 5, iterations: int = 30) -> float:
         for _ in range(warmup):
             fn()
@@ -411,7 +456,7 @@ def main() -> None:
         "routed_only": bench_ms(routed_only_thunk),
         "shared_standalone": bench_ms(reference_thunk),
         "sequential_baseline": bench_ms(sequential_baseline),
-        "routed_plus_shared_fc12": bench_ms(thunk),
+        "routed_plus_shared_fc1_dense_fc2": bench_ms(integrated_split_fc2),
         "dense_shared_fc2": bench_ms(dense_fc2),
     }
     print("timings_ms", timings, flush=True)

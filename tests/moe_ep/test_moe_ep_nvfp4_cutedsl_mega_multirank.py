@@ -165,12 +165,15 @@ def _make_packed_weights(
 def _mega_problem(
     rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
 ):
-    hidden = 2048
-    intermediate = 1024
-    num_experts = 8
-    topk = 4
-    gate_up_clamp = 10.0
+    hidden = int(os.environ.get("MEGA_TEST_HIDDEN", "2048"))
+    intermediate = int(os.environ.get("MEGA_TEST_INTERMEDIATE", "1024"))
+    num_experts = int(os.environ.get("MEGA_TEST_NUM_EXPERTS", "8"))
+    topk = int(os.environ.get("MEGA_TEST_TOPK", "4"))
     fast_math = True
+    activation = os.environ.get("MEGA_TEST_ACTIVATION", "swiglu")
+    gate_up_clamp = None if activation == "situ" else 10.0
+    situ_beta = 7.0 if activation == "situ" else None
+    situ_linear_beta = 1.0 if activation == "situ" else None
 
     assert hidden % 128 == 0
     assert intermediate % 128 == 0
@@ -201,9 +204,9 @@ def _mega_problem(
         num_experts=num_experts,
         topk=topk,
         gate_up_clamp=gate_up_clamp,
-        activation="swiglu",
-        situ_beta=None,
-        situ_linear_beta=None,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         fast_math=fast_math,
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -410,6 +413,7 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
+    shared_expert: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -437,19 +441,156 @@ def _run_mega_layer(
     problem = _mega_problem(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
+    if shared_expert and os.environ.get("SHARED_TEST_DISABLE_ROUTED") == "1":
+        problem["topk_ids"].fill_(-1)
+    routed_tokens = int(
+        os.environ.get("SHARED_TEST_ROUTED_TOKENS", problem["num_tokens"])
+    )
+    if routed_tokens < problem["num_tokens"]:
+        problem["topk_ids"][routed_tokens:].fill_(-1)
+    shared_intermediate = int(
+        os.environ.get("SHARED_TEST_INTERMEDIATE", problem["intermediate"])
+    )
+    shared_capacity = int(
+        os.environ.get("SHARED_TEST_CAPACITY", problem["num_tokens"])
+    )
     config_extra = dict(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
     )
+    if os.environ.get("SHARED_TEST_PRODUCTION_KNOBS") == "1":
+        cluster_m = int(os.environ.get("SHARED_TEST_CLUSTER_M", "2"))
+        config_extra["knobs"] = {
+            "cluster_shape_mnk": (cluster_m, 1, 1),
+            "group_hint": 512,
+            "max_active_clusters": 120 // cluster_m,
+            "epi_flag_batch": (2, 4),
+            "load_balance_mode": "atomic_counter",
+            "mma_tiler_mnk": (128 * cluster_m, 128, 256),
+            "flag_batch": 4,
+            "token_back_mode": "standalone_warps",
+        }
+    if shared_expert:
+        config_extra.update(
+            shared_hidden_size=problem["hidden"],
+            shared_intermediate_size=shared_intermediate,
+        )
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
     )
+    print(f"rank {rank}: bootstrapping MegaMoE runtime", flush=True)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
     )
 
+    print(f"rank {rank}: MegaMoE runtime ready", flush=True)
     try:
+        shared_inputs = None
+        shared_reference = None
+        shared_buffer = None
+        if shared_expert:
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                MegaMoESharedNvfp4Inputs,
+                fused_quant_stage,
+                get_symm_buffer_for_mega_moe,
+            )
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+                preprocess_mega_weights,
+            )
+
+            shared_g = torch.Generator(device="cuda").manual_seed(101)
+            shared_w13 = torch.randn(
+                1,
+                2 * shared_intermediate,
+                problem["hidden"],
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=shared_g,
+            )
+            shared_w2 = torch.randn(
+                1,
+                problem["hidden"],
+                shared_intermediate,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=shared_g,
+            )
+            shared_fc1, shared_fc2 = preprocess_mega_weights(
+                MoEWeightPack(w13=shared_w13, w2=shared_w2),
+                intermediate_size=shared_intermediate,
+                hidden_size=problem["hidden"],
+            )
+            shared_buffer = get_symm_buffer_for_mega_moe(
+                1,
+                shared_capacity,
+                1,
+                problem["hidden"],
+                2 * shared_intermediate,
+                0,
+                1,
+                activation=problem["activation"],
+                situ_beta=problem["situ_beta"],
+                situ_linear_beta=problem["situ_linear_beta"],
+                local_only=True,
+            )
+            shared_topk_ids = torch.zeros(
+                problem["num_tokens"], 1, dtype=torch.int64, device="cuda"
+            )
+            shared_topk_weights = torch.ones(
+                problem["num_tokens"], 1, dtype=torch.float32, device="cuda"
+            )
+            sf_rows = ((shared_capacity + 127) // 128) * 128
+            activation_sf = torch.zeros(
+                sf_rows,
+                ((problem["hidden"] // 16 + 3) // 4) * 4,
+                dtype=torch.float8_e4m3fn,
+                device="cuda",
+            )
+            fused_quant_stage(
+                problem["hidden_states"],
+                shared_topk_ids,
+                shared_topk_weights,
+                shared_buffer.x,
+                activation_sf,
+                shared_buffer.topk_idx,
+                shared_buffer.topk_weights,
+                quant_type="nvfp4",
+                norm_const=1.0,
+                sf_layout="blocked_128x4",
+            )
+            sf_cols = ((shared_intermediate // 16 + 3) // 4) * 4
+            shared_inputs = MegaMoESharedNvfp4Inputs(
+                activation=shared_buffer.x,
+                activation_sf=activation_sf,
+                fc1_weight=shared_fc1[0],
+                fc1_weight_sf=shared_fc1[1],
+                fc1_output=torch.empty(
+                    shared_capacity,
+                    shared_intermediate // 2,
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="cuda",
+                ),
+                fc1_output_sf=torch.zeros(
+                    sf_rows,
+                    sf_cols,
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                fc2_weight=shared_fc2[0],
+                fc2_weight_sf=shared_fc2[1],
+                fc1_alpha=shared_buffer.fc1_alpha,
+                fc2_alpha=shared_buffer.fc2_alpha,
+                fc1_norm_const=shared_buffer.fc1_norm_const,
+                fc1_done_counter=torch.zeros(
+                    max(shared_capacity, 1),
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+                output_activation=shared_buffer.output_activation,
+            )
+            shared_inputs.output_activation.zero_()
+
         if quantize_input:
             t_hidden = problem["hidden_states"]
             t_scales = None
@@ -516,9 +657,59 @@ def _run_mega_layer(
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
             scales=t_scales,
+            mega_shared_inputs=shared_inputs,
             **tensor_kwargs,
         )
+        print(
+            f"rank {rank}: launching MegaMoE forward "
+            f"(shared_expert={shared_expert})",
+            flush=True,
+        )
         y_layer = mega.forward(t).clone()
+        print(f"rank {rank}: MegaMoE forward complete", flush=True)
+        shared_actual = None
+        if shared_inputs is not None:
+            shared_actual = shared_inputs.output_activation[
+                : problem["num_tokens"]
+            ].clone()
+            print(f"rank {rank}: launching shared reference", flush=True)
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                get_symm_buffer_for_mega_moe,
+                nvfp4_mega_launch_thunk,
+            )
+
+            reference_buffer = get_symm_buffer_for_mega_moe(
+                1,
+                shared_capacity,
+                1,
+                problem["hidden"],
+                2 * shared_intermediate,
+                0,
+                1,
+                activation=problem["activation"],
+                situ_beta=problem["situ_beta"],
+                situ_linear_beta=problem["situ_linear_beta"],
+                local_only=True,
+            )
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                shared_topk_weights,
+                shared_topk_ids,
+                reference_buffer.x[: problem["num_tokens"]],
+                reference_buffer.x_sf[: problem["num_tokens"]],
+                reference_buffer.topk_idx[: problem["num_tokens"]],
+                reference_buffer.topk_weights[: problem["num_tokens"]],
+            )
+            reference_thunk = nvfp4_mega_launch_thunk(
+                shared_fc1, shared_fc2, reference_buffer
+            )
+            reference_thunk()
+            torch.cuda.synchronize()
+            print(f"rank {rank}: shared reference complete", flush=True)
+            shared_reference = reference_buffer.output_activation[
+                : problem["num_tokens"]
+            ].clone()
+            reference_buffer.destroy()
         clear_tokens = min(
             ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
             problem["max_tokens"],
@@ -547,6 +738,11 @@ def _run_mega_layer(
             assert torch.equal(y_view_repeat, y_layer)
 
         torch.cuda.synchronize()
+        if shared_reference is not None:
+            torch.testing.assert_close(
+                shared_actual,
+                shared_reference,
+            )
         if untouched_tail:
             assert torch.all(
                 mega._workspace.output_activation[clear_tokens:] == 7.0
@@ -598,6 +794,8 @@ def _run_mega_layer(
                 f"vs bf16 combine exceeds {band}"
             )
         mega.destroy()
+        if shared_buffer is not None:
+            shared_buffer.destroy()
         return rank
     finally:
         finalize_moe_ep_runtime(runtime)
@@ -619,6 +817,27 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
     )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert():
+    """Distributed shared-expert staging completes and matches its reference."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    num_tokens = int(os.environ.get("SHARED_TEST_TOKENS", "64"))
+    max_tokens = int(os.environ.get("MEGA_TEST_MAX_TOKENS", str(num_tokens)))
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=num_tokens,
+        max_tokens=max_tokens,
+        shared_expert=True,
+    )
+    print(f"rank {rank}: shared expert matches the standalone NVFP4 reference")
 
 
 @pytest.mark.gpu_4
