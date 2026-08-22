@@ -146,6 +146,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            shared_hidden=k.shared_hidden_size,
+            shared_intermediate=(
+                2 * k.shared_intermediate_size
+                if k.shared_intermediate_size is not None
+                else None
+            ),
         )
 
     def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
@@ -235,6 +241,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.fc2_alpha.copy_(t.fc2_alpha)
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+        workspace._mega_shared_inputs = t.mega_shared_inputs
 
     def validate_capture_ready(
         self,
@@ -282,6 +289,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
+            shared=getattr(workspace, "_mega_shared_inputs", None),
         )
 
     def _prepared_thunk_state(
@@ -304,6 +312,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             if num_tokens is None
             else min(((max(num_tokens, 1) + 63) // 64) * 64, workspace.x.shape[0])
         )
+        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
+        shared_identity = (
+            tuple(t.data_ptr() for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
+            if shared_inputs is not None else ()
+        )
         weight_identity = tuple(
             id(tensor) for transformed in transformed_weights for tensor in transformed
         )
@@ -313,6 +326,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             id(mega.compiled) if mega is not None and mega.compiled else None,
             stream,
             clear_tokens,
+            shared_identity,
         )
         state = self._thunk_states.get(key)
         if state is None or key[2] is None:
@@ -322,7 +336,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             thunk = fe.make_launch_thunk(inputs, zero_num_tokens=clear_tokens)
             mega = fe._mega
             assert mega is not None and mega.compiled is not None
-            key = (key[0], key[1], id(mega.compiled), stream, clear_tokens)
+            key = (*key[:2], id(mega.compiled), *key[3:])
             state = (key, thunk, workspace.output_activation)
             self._thunk_states[key] = state
         return state
@@ -408,6 +422,19 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             reducer, partials, workspace_root, stream = reducer_state
             reducer.run(partials, out_buf, num_tokens, stream)
             del workspace_root
+        shared = getattr(workspace, "_mega_shared_inputs", None)
+        if shared is not None:
+            from flashinfer import mm_fp4
+
+            mm_fp4(
+                shared.fc1_output.view(torch.uint8),
+                shared.fc2_weight[0].view(torch.uint8),
+                shared.fc1_output_sf,
+                shared.fc2_weight_sf[0],
+                alpha=shared.fc2_alpha,
+                out=shared.output_activation,
+                backend="cute-dsl",
+            )
         if output is not None:
             output.copy_(out_buf[:num_tokens])
             return output
@@ -447,6 +474,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.enable_in_kernel_fc2_reduce,
             self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,
+            k.shared_hidden_size,
+            k.shared_intermediate_size,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
