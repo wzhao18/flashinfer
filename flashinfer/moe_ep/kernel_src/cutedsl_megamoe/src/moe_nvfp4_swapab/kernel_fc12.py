@@ -2201,11 +2201,20 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     scheduler._num_shared_token_blocks
                     * scheduler._num_shared_fc1_blocks
                 )
-                while shared_tile_idx < shared_fc1_tile_count:
-                    scheduler.gen_shared_work(shared_tile_idx)
-                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
-                    scheduler.publish_work()
-                    shared_tile_idx += scheduler.num_persistent_clusters
+                shared_fc1_waves = (
+                    shared_fc1_tile_count
+                    + scheduler.num_persistent_clusters
+                    - 1
+                ) // scheduler.num_persistent_clusters
+                shared_fc1_workers = (
+                    shared_fc1_tile_count + shared_fc1_waves - 1
+                ) // shared_fc1_waves
+                if shared_tile_idx < shared_fc1_workers:
+                    while shared_tile_idx < shared_fc1_tile_count:
+                        scheduler.gen_shared_work(shared_tile_idx)
+                        ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                        scheduler.publish_work()
+                        shared_tile_idx += shared_fc1_workers
 
             # MegaMoE subclass uses this hook to wait for this CTA's
             # dispatch warps to finish ``_dispatch_barrier`` -- only then

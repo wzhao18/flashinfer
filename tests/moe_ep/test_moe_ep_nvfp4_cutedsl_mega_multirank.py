@@ -451,6 +451,9 @@ def _run_mega_layer(
     shared_intermediate = int(
         os.environ.get("SHARED_TEST_INTERMEDIATE", problem["intermediate"])
     )
+    shared_hidden = int(
+        os.environ.get("SHARED_TEST_HIDDEN", problem["hidden"])
+    )
     shared_capacity = int(
         os.environ.get("SHARED_TEST_CAPACITY", problem["num_tokens"])
     )
@@ -472,7 +475,7 @@ def _run_mega_layer(
         }
     if shared_expert:
         config_extra.update(
-            shared_hidden_size=problem["hidden"],
+            shared_hidden_size=shared_hidden,
             shared_intermediate_size=shared_intermediate,
         )
     kernel = create_mega_kernel(
@@ -500,17 +503,24 @@ def _run_mega_layer(
             )
 
             shared_g = torch.Generator(device="cuda").manual_seed(101)
+            shared_hidden_states = torch.randn(
+                problem["num_tokens"],
+                shared_hidden,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=shared_g,
+            )
             shared_w13 = torch.randn(
                 1,
                 2 * shared_intermediate,
-                problem["hidden"],
+                shared_hidden,
                 dtype=torch.bfloat16,
                 device="cuda",
                 generator=shared_g,
             )
             shared_w2 = torch.randn(
                 1,
-                problem["hidden"],
+                shared_hidden,
                 shared_intermediate,
                 dtype=torch.bfloat16,
                 device="cuda",
@@ -519,13 +529,13 @@ def _run_mega_layer(
             shared_fc1, shared_fc2 = preprocess_mega_weights(
                 MoEWeightPack(w13=shared_w13, w2=shared_w2),
                 intermediate_size=shared_intermediate,
-                hidden_size=problem["hidden"],
+                hidden_size=shared_hidden,
             )
             shared_buffer = get_symm_buffer_for_mega_moe(
                 1,
                 shared_capacity,
                 1,
-                problem["hidden"],
+                shared_hidden,
                 2 * shared_intermediate,
                 0,
                 1,
@@ -543,12 +553,12 @@ def _run_mega_layer(
             sf_rows = ((shared_capacity + 127) // 128) * 128
             activation_sf = torch.zeros(
                 sf_rows,
-                ((problem["hidden"] // 16 + 3) // 4) * 4,
+                ((shared_hidden // 16 + 3) // 4) * 4,
                 dtype=torch.float8_e4m3fn,
                 device="cuda",
             )
             fused_quant_stage(
-                problem["hidden_states"],
+                shared_hidden_states,
                 shared_topk_ids,
                 shared_topk_weights,
                 shared_buffer.x,
@@ -709,7 +719,7 @@ def _run_mega_layer(
                 1,
                 shared_capacity,
                 1,
-                problem["hidden"],
+                shared_hidden,
                 2 * shared_intermediate,
                 0,
                 1,
@@ -719,7 +729,7 @@ def _run_mega_layer(
                 local_only=True,
             )
             stage_mega_moe_inputs(
-                problem["hidden_states"],
+                shared_hidden_states,
                 shared_topk_weights,
                 shared_topk_ids,
                 reference_buffer.x[: problem["num_tokens"]],
