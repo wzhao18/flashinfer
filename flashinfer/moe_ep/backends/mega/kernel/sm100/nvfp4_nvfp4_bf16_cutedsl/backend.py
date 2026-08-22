@@ -344,7 +344,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         shared = shared_inputs
         if (
             shared is not None
-            and num_tokens > _MAX_INTEGRATED_SHARED_FC2_TOKENS
+            and (
+                self.ep_world_size > 1
+                or num_tokens > _MAX_INTEGRATED_SHARED_FC2_TOKENS
+            )
         ):
             from flashinfer import mm_fp4
 
