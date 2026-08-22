@@ -248,7 +248,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> None:
-        frontend = workspace._frontend
+        frontend = workspace.frontend_for_shared_inputs(
+            getattr(workspace, "_mega_shared_inputs", None)
+        )
         mega = frontend._mega
         if mega is None or mega.compiled is None:
             raise RuntimeError(
@@ -299,7 +301,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         num_tokens: int | None = None,
     ) -> tuple:
         kcfg = self._kernel_config
-        fe = workspace._frontend
+        fe = workspace.frontend_for_shared_inputs(
+            getattr(workspace, "_mega_shared_inputs", None)
+        )
         fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
@@ -399,9 +403,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         state = self._prepared_thunk_state(workspace, transformed_weights, num_tokens)
         key, thunk, out_buf = state
         reducer_state = None
-        if workspace._frontend.config.defer_topk_reduce:
+        fe = workspace.frontend_for_shared_inputs(
+            getattr(workspace, "_mega_shared_inputs", None)
+        )
+        if fe.config.defer_topk_reduce:
             partials, workspace_root, _region = (
-                workspace._frontend.deferred_topk_reduce_workspace()
+                fe.deferred_topk_reduce_workspace()
             )
             # Resolve/load the native module and borrowed view before the
             # upstream launch.  The terminal interval below must contain only
