@@ -655,6 +655,16 @@ def _run_mega_layer(
         layer_shared_inputs = shared_inputs
         if os.environ.get("SHARED_TEST_ROUTED_ONLY_FRONTEND") == "1":
             layer_shared_inputs = None
+        if os.environ.get("SHARED_TEST_ROUTE_THEN_FUSED") == "1":
+            routed_t = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                mega_shared_inputs=None,
+                **tensor_kwargs,
+            )
+            mega.forward(routed_t)
         t = MoEEpTensors(
             hidden_states=t_hidden,
             topk_ids=problem["topk_ids"],
@@ -669,6 +679,20 @@ def _run_mega_layer(
             flush=True,
         )
         y_layer = mega.forward(t).clone()
+        if os.environ.get("SHARED_TEST_ROUTE_THEN_FUSED") == "1":
+            workspace = mega._workspace
+            routed_mega = workspace._routed_frontend._mega
+            fused_mega = workspace._frontend._mega
+            assert routed_mega is not None
+            assert fused_mega is not None
+            assert (
+                routed_mega.local_workspace.data_ptr()
+                == fused_mega.local_workspace.data_ptr()
+            )
+            assert (
+                routed_mega.shared_workspace.data_ptr()
+                == fused_mega.shared_workspace.data_ptr()
+            )
         print(f"rank {rank}: MegaMoE forward complete", flush=True)
         shared_actual = None
         if layer_shared_inputs is not None:

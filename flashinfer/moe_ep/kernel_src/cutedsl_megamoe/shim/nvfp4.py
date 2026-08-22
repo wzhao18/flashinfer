@@ -295,6 +295,7 @@ class MegaMoENvfp4Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        self._workspace_peer: Optional[MegaMoENvfp4Frontend] = None
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -616,19 +617,36 @@ class MegaMoENvfp4Frontend:
             )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
-        local_workspace = torch.zeros(
-            (local_ws_bytes,),
-            dtype=torch.uint8,
-            device="cuda",
+        peer_mega = (
+            self._workspace_peer._mega if self._workspace_peer is not None else None
         )
-        shared_workspace = sym_zeros(
-            (shared_ws_bytes,), torch.uint8, local_only=c.local_only
+        can_share_workspaces = bool(
+            peer_mega is not None
+            and peer_mega.local_workspace.numel() >= local_ws_bytes
+            and peer_mega.shared_workspace.numel() >= shared_ws_bytes
+            and peer_mega.kernel._local_offsets == kernel._local_offsets
+            and peer_mega.kernel._shared_offsets == kernel._shared_offsets
         )
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-            local_only=c.local_only,
-        )
+        if can_share_workspaces:
+            assert peer_mega is not None
+            local_workspace = peer_mega.local_workspace
+            shared_workspace = peer_mega.shared_workspace
+            symmetric_base = peer_mega.symmetric_base
+            peer_offsets_list = peer_mega.peer_offsets_list
+        else:
+            local_workspace = torch.zeros(
+                (local_ws_bytes,),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            shared_workspace = sym_zeros(
+                (shared_ws_bytes,), torch.uint8, local_only=c.local_only
+            )
+            symmetric_base, peer_offsets_list = _compute_peer_offsets(
+                shared_workspace,
+                c.world_size,
+                local_only=c.local_only,
+            )
 
         mega = _CompiledMega(
             compiled=None,
@@ -637,6 +655,7 @@ class MegaMoENvfp4Frontend:
             shared_workspace=shared_workspace,
             symmetric_base=symmetric_base,
             peer_offsets_list=peer_offsets_list,
+            owns_workspaces=not can_share_workspaces,
         )
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
@@ -669,9 +688,21 @@ class MegaMoENvfp4Frontend:
         self._mega = None
 
     def _release_workspace(self) -> None:
-        if self._mega is not None:
-            ensure_not_capturing("workspace release (symmetric-heap free)")
-            free_sym_tensor(self._mega.shared_workspace)
+        mega = self._mega
+        if mega is None or not mega.owns_workspaces:
+            return
+        ensure_not_capturing("workspace release (symmetric-heap free)")
+        peer_mega = (
+            self._workspace_peer._mega if self._workspace_peer is not None else None
+        )
+        if (
+            peer_mega is not None
+            and peer_mega.shared_workspace.data_ptr()
+            == mega.shared_workspace.data_ptr()
+        ):
+            peer_mega.owns_workspaces = True
+        else:
+            free_sym_tensor(mega.shared_workspace)
 
     @staticmethod
     def _resolve_num_tokens(
@@ -1265,6 +1296,8 @@ class MegaMoESymmBuffer:
                 shared_intermediate=None,
             )
             self._routed_frontend = MegaMoENvfp4Frontend(config)
+            self._frontend._workspace_peer = self._routed_frontend
+            self._routed_frontend._workspace_peer = self._frontend
         return self._routed_frontend
 
     def destroy(self) -> None:
