@@ -358,13 +358,10 @@ class TrtllmAgRsLayer:
 def make_shared_state(max_tokens_per_rank: int):
     import torch
 
-    from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
-        preprocess_mega_weights,
-    )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-        MegaMoESharedNvfp4Inputs,
-        get_symm_buffer_for_mega_moe,
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        Nvfp4CutedslSharedExpertSession,
+        preprocess_nvfp4_cutedsl_mega_weights,
     )
 
     hidden = 7168
@@ -392,76 +389,23 @@ def make_shared_state(max_tokens_per_rank: int):
         )
         / 64
     )
-    fc1, fc2 = preprocess_mega_weights(
+    weights = preprocess_nvfp4_cutedsl_mega_weights(
         MoEWeightPack(w13=w13, w2=w2),
         intermediate_size=intermediate,
         hidden_size=hidden,
     )
-    buffer = get_symm_buffer_for_mega_moe(
-        1,
-        max_tokens_per_rank,
-        1,
-        hidden,
-        2 * intermediate,
-        0,
-        1,
-        activation="situ",
+    session = Nvfp4CutedslSharedExpertSession(
+        max_num_tokens=max_tokens_per_rank,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_sms=28,
         situ_beta=4.0,
         situ_linear_beta=25.0,
-        local_only=True,
     )
-    sf_rows = math.ceil(max_tokens_per_rank / 128) * 128
-    sf_hidden = math.ceil((hidden // 16) / 4) * 4
-    sf_intermediate = math.ceil((intermediate // 16) / 4) * 4
-    shared = MegaMoESharedNvfp4Inputs(
-        activation=buffer.x,
-        activation_sf=torch.zeros(
-            sf_rows,
-            sf_hidden,
-            dtype=torch.float8_e4m3fn,
-            device="cuda",
-        ),
-        fc1_weight=fc1[0],
-        fc1_weight_sf=fc1[1],
-        fc1_output=torch.empty(
-            max_tokens_per_rank,
-            intermediate // 2,
-            dtype=torch.float4_e2m1fn_x2,
-            device="cuda",
-        ),
-        fc1_output_sf=torch.zeros(
-            sf_rows,
-            sf_intermediate,
-            dtype=torch.float8_e4m3fn,
-            device="cuda",
-        ),
-        fc2_weight=fc2[0],
-        fc2_weight_sf=fc2[1],
-        fc1_alpha=buffer.fc1_alpha,
-        fc2_alpha=buffer.fc2_alpha,
-        fc1_norm_const=buffer.fc1_norm_const,
-        fc1_done_counter=torch.zeros(
-            max_tokens_per_rank, dtype=torch.int32, device="cuda"
-        ),
-        output_activation=buffer.output_activation,
-    )
-    return shared, buffer
+    return session, weights
 
 
-def active_shared_inputs(shared, tokens_per_rank: int):
-    sf_rows = math.ceil(tokens_per_rank / 128) * 128
-    return dataclasses.replace(
-        shared,
-        activation=shared.activation[:tokens_per_rank],
-        activation_sf=shared.activation_sf[:sf_rows],
-        fc1_output=shared.fc1_output[:tokens_per_rank],
-        fc1_output_sf=shared.fc1_output_sf[:sf_rows],
-        fc1_done_counter=shared.fc1_done_counter[:tokens_per_rank],
-        output_activation=shared.output_activation[:tokens_per_rank],
-    )
-
-
-def make_case(rank: int, world_size: int, global_tokens: int, shared):
+def make_case(rank: int, world_size: int, global_tokens: int, shared_state):
     import torch
 
     tokens_per_rank = math.ceil(global_tokens / world_size)
@@ -489,8 +433,8 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared):
         topk_weights[active_tokens:].zero_()
     shared_inputs = None
     shared_stage = None
-    if shared is not None:
-        shared_inputs = active_shared_inputs(shared, tokens_per_rank)
+    if shared_state is not None:
+        shared_session, shared_weights = shared_state
         shared_hidden = torch.randn(
             tokens_per_rank,
             7168,
@@ -498,17 +442,9 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared):
             device="cuda",
             generator=generator,
         )
-        shared_topk_ids = torch.zeros(
-            tokens_per_rank, 1, dtype=torch.int64, device="cuda"
-        )
-        shared_topk_weights = torch.ones(
-            tokens_per_rank, 1, dtype=torch.float32, device="cuda"
-        )
-        shared_stage = (
-            shared_hidden,
-            shared_topk_ids,
-            shared_topk_weights,
-        )
+        shared_session.stage(shared_hidden, integrated=True)
+        shared_inputs = shared_session.integrated_inputs(shared_weights)
+        shared_stage = shared_hidden
     tensors = CaseTensors(
         hidden_states=hidden,
         topk_ids=topk_ids,
@@ -518,23 +454,8 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared):
     return tensors, shared_stage, active_tokens, tokens_per_rank
 
 
-def stage_shared(shared_inputs, shared_buffer, shared_stage) -> None:
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fused_quant_stage
-
-    hidden_states, topk_ids, topk_weights = shared_stage
-    tokens = hidden_states.shape[0]
-    fused_quant_stage(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        shared_inputs.activation,
-        shared_inputs.activation_sf,
-        shared_buffer.topk_idx[:tokens],
-        shared_buffer.topk_weights[:tokens],
-        quant_type="nvfp4",
-        norm_const=1.0,
-        sf_layout="blocked_128x4",
-    )
+def stage_shared(shared_session, hidden_states) -> None:
+    shared_session.stage(hidden_states, integrated=True)
 
 
 def max_rank_time_ms(local_ms: float) -> float:
@@ -550,7 +471,7 @@ def run_case(
     layer,
     tensors,
     shared_stage,
-    shared_buffer,
+    shared_session,
     warmup: int,
     repeat: int,
     profile_cuda_range: bool,
@@ -560,7 +481,7 @@ def run_case(
 
     def invoke():
         if shared_stage is not None:
-            stage_shared(tensors.mega_shared_inputs, shared_buffer, shared_stage)
+            stage_shared(shared_session, shared_stage)
         if getattr(layer, "supports_output_view", False):
             return layer.forward(tensors, return_workspace_view=True)
         return layer.forward(tensors)
@@ -627,12 +548,11 @@ def main() -> int:
         raise ValueError(f"expected EP{args.expected_world_size}, got EP{world_size}")
 
     max_tokens_per_rank = max(math.ceil(t / world_size) for t in args.global_tokens)
-    shared = None
-    shared_buffer = None
+    shared_state = None
     if args.provider.startswith("mega"):
         layer = make_mega_layer(rank, world_size, max_tokens_per_rank)
         if args.provider == "mega-fused":
-            shared, shared_buffer = make_shared_state(max_tokens_per_rank)
+            shared_state = make_shared_state(max_tokens_per_rank)
     else:
         layer = make_trtllm_layer(rank, world_size, max_tokens_per_rank)
 
@@ -655,13 +575,13 @@ def main() -> int:
         print(header, flush=True)
     for global_tokens in args.global_tokens:
         tensors, shared_stage, active_tokens, tokens_per_rank = make_case(
-            rank, world_size, global_tokens, shared
+            rank, world_size, global_tokens, shared_state
         )
         result = run_case(
             layer,
             tensors,
             shared_stage,
-            shared_buffer,
+            shared_state[0] if shared_state is not None else None,
             args.warmup,
             args.repeat,
             args.profile_cuda_range,
@@ -688,8 +608,8 @@ def main() -> int:
                     output_file.write(json.dumps(result, sort_keys=True) + "\n")
 
     layer.destroy()
-    if shared_buffer is not None:
-        shared_buffer.destroy()
+    if shared_state is not None:
+        shared_state[0].buffer.destroy()
     dist.destroy_process_group()
     return 0
 

@@ -489,13 +489,9 @@ def _run_mega_layer(
         shared_reference = None
         shared_buffer = None
         if shared_expert:
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-                MegaMoESharedNvfp4Inputs,
-                fused_quant_stage,
-                get_symm_buffer_for_mega_moe,
-            )
-            from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
-                preprocess_mega_weights,
+            from flashinfer.moe_ep import (
+                Nvfp4CutedslSharedExpertSession,
+                preprocess_nvfp4_cutedsl_mega_weights,
             )
 
             shared_g = torch.Generator(device="cuda").manual_seed(101)
@@ -522,79 +518,24 @@ def _run_mega_layer(
                 device="cuda",
                 generator=shared_g,
             )
-            shared_fc1, shared_fc2 = preprocess_mega_weights(
+            shared_weights = preprocess_nvfp4_cutedsl_mega_weights(
                 MoEWeightPack(w13=shared_w13, w2=shared_w2),
                 intermediate_size=shared_intermediate,
                 hidden_size=shared_hidden,
             )
-            shared_buffer = get_symm_buffer_for_mega_moe(
-                1,
-                shared_capacity,
-                1,
-                shared_hidden,
-                2 * shared_intermediate,
-                0,
-                1,
-                activation=problem["activation"],
+            shared_session = Nvfp4CutedslSharedExpertSession(
+                max_num_tokens=shared_capacity,
+                hidden_size=shared_hidden,
+                intermediate_size=shared_intermediate,
+                num_sms=torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count,
                 situ_beta=problem["situ_beta"],
                 situ_linear_beta=problem["situ_linear_beta"],
-                local_only=True,
             )
-            shared_topk_ids = torch.zeros(
-                problem["num_tokens"], 1, dtype=torch.int64, device="cuda"
-            )
-            shared_topk_weights = torch.ones(
-                problem["num_tokens"], 1, dtype=torch.float32, device="cuda"
-            )
-            sf_rows = ((shared_capacity + 127) // 128) * 128
-            activation_sf = torch.zeros(
-                sf_rows,
-                ((shared_hidden // 16 + 3) // 4) * 4,
-                dtype=torch.float8_e4m3fn,
-                device="cuda",
-            )
-            fused_quant_stage(
-                shared_hidden_states,
-                shared_topk_ids,
-                shared_topk_weights,
-                shared_buffer.x,
-                activation_sf,
-                shared_buffer.topk_idx,
-                shared_buffer.topk_weights,
-                quant_type="nvfp4",
-                norm_const=1.0,
-                sf_layout="blocked_128x4",
-            )
-            sf_cols = ((shared_intermediate // 16 + 3) // 4) * 4
-            shared_inputs = MegaMoESharedNvfp4Inputs(
-                activation=shared_buffer.x,
-                activation_sf=activation_sf,
-                fc1_weight=shared_fc1[0],
-                fc1_weight_sf=shared_fc1[1],
-                fc1_output=torch.empty(
-                    shared_capacity,
-                    shared_intermediate // 2,
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="cuda",
-                ),
-                fc1_output_sf=torch.zeros(
-                    sf_rows,
-                    sf_cols,
-                    dtype=torch.float8_e4m3fn,
-                    device="cuda",
-                ),
-                fc2_weight=shared_fc2[0],
-                fc2_weight_sf=shared_fc2[1],
-                fc1_alpha=shared_buffer.fc1_alpha,
-                fc2_alpha=shared_buffer.fc2_alpha,
-                fc1_norm_const=shared_buffer.fc1_norm_const,
-                fc1_done_counter=torch.zeros(
-                    max(shared_capacity, 1),
-                    dtype=torch.int32,
-                    device="cuda",
-                ),
-                output_activation=shared_buffer.output_activation,
-            )
+            shared_session.stage(shared_hidden_states, integrated=True)
+            shared_inputs = shared_session.integrated_inputs(shared_weights)
+            shared_buffer = shared_session.buffer
             shared_inputs.output_activation.zero_()
 
         if quantize_input:
@@ -701,47 +642,24 @@ def _run_mega_layer(
         print(f"rank {rank}: MegaMoE forward complete", flush=True)
         shared_actual = None
         if layer_shared_inputs is not None:
-            shared_actual = shared_inputs.output_activation[
-                : problem["num_tokens"]
-            ].clone()
+            shared_actual = shared_session.output().clone()
             print(f"rank {rank}: launching shared reference", flush=True)
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-                get_symm_buffer_for_mega_moe,
-                nvfp4_mega_launch_thunk,
-            )
-
-            reference_buffer = get_symm_buffer_for_mega_moe(
-                1,
-                shared_capacity,
-                1,
-                shared_hidden,
-                2 * shared_intermediate,
-                0,
-                1,
-                activation=problem["activation"],
+            reference_session = Nvfp4CutedslSharedExpertSession(
+                max_num_tokens=shared_capacity,
+                hidden_size=shared_hidden,
+                intermediate_size=shared_intermediate,
+                num_sms=torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count,
                 situ_beta=problem["situ_beta"],
                 situ_linear_beta=problem["situ_linear_beta"],
-                local_only=True,
             )
-            stage_mega_moe_inputs(
-                shared_hidden_states,
-                shared_topk_weights,
-                shared_topk_ids,
-                reference_buffer.x[: problem["num_tokens"]],
-                reference_buffer.x_sf[: problem["num_tokens"]],
-                reference_buffer.topk_idx[: problem["num_tokens"]],
-                reference_buffer.topk_weights[: problem["num_tokens"]],
-            )
-            reference_thunk = nvfp4_mega_launch_thunk(
-                shared_fc1, shared_fc2, reference_buffer
-            )
-            reference_thunk()
+            reference_session.stage(shared_hidden_states, integrated=False)
+            reference_session.run(shared_weights)
             torch.cuda.synchronize()
             print(f"rank {rank}: shared reference complete", flush=True)
-            shared_reference = reference_buffer.output_activation[
-                : problem["num_tokens"]
-            ].clone()
-            reference_buffer.destroy()
+            shared_reference = reference_session.output().clone()
+            reference_session.buffer.destroy()
         clear_tokens = min(
             ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
             problem["max_tokens"],

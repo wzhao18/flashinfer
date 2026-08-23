@@ -70,6 +70,7 @@ from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+    Nvfp4CutedslSharedExpertSession,
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
@@ -168,6 +169,7 @@ __all__ = [
     "DeepGemmMegaMoeConfig",
     "Mxfp8CutedslMegaMoeConfig",
     "Nvfp4CutedslMegaMoeConfig",
+    "Nvfp4CutedslSharedExpertSession",
     "Sm90PullFp8MegaMoeConfig",
     "Sm90PushFp8MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
