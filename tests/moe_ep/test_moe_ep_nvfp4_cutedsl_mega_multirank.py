@@ -885,12 +885,16 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert():
         pytest.skip("needs >=4 ranks")
     num_tokens = int(os.environ.get("SHARED_TEST_TOKENS", "64"))
     max_tokens = int(os.environ.get("MEGA_TEST_MAX_TOKENS", str(num_tokens)))
+    in_kernel_fc2_reduce = (
+        os.environ.get("SHARED_TEST_IN_KERNEL_FC2_REDUCE", "0") == "1"
+    )
     rank = _run_mega_layer(
         rank,
         world_size,
         quantize_input=True,
         num_tokens=num_tokens,
         max_tokens=max_tokens,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         shared_expert=True,
     )
     print(f"rank {rank}: shared expert matches the standalone NVFP4 reference")
