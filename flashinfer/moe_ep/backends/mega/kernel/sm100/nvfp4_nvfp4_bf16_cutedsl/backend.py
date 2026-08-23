@@ -249,7 +249,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         transformed_weights: TransformedMegaWeights,
     ) -> None:
         frontend = workspace.frontend_for_shared_inputs(
-            getattr(workspace, "_mega_shared_inputs", None)
+            workspace._mega_shared_inputs
         )
         mega = frontend._mega
         if mega is None or mega.compiled is None:
@@ -291,7 +291,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
-            shared=getattr(workspace, "_mega_shared_inputs", None),
+            shared=workspace._mega_shared_inputs,
         )
 
     def _prepared_thunk_state(
@@ -302,7 +302,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> tuple:
         kcfg = self._kernel_config
         fe = workspace.frontend_for_shared_inputs(
-            getattr(workspace, "_mega_shared_inputs", None)
+            workspace._mega_shared_inputs
         )
         fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
         clamp = _resolve_gate_up_clamp(kcfg)
@@ -316,7 +316,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             if num_tokens is None
             else min(((max(num_tokens, 1) + 63) // 64) * 64, workspace.x.shape[0])
         )
-        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
+        shared_inputs = workspace._mega_shared_inputs
         shared_identity = (
             tuple((t.data_ptr(), tuple(t.shape)) for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
             if shared_inputs is not None else ()
@@ -404,7 +404,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         key, thunk, out_buf = state
         reducer_state = None
         fe = workspace.frontend_for_shared_inputs(
-            getattr(workspace, "_mega_shared_inputs", None)
+            workspace._mega_shared_inputs
         )
         if fe.config.defer_topk_reduce:
             partials, workspace_root, _region = (
