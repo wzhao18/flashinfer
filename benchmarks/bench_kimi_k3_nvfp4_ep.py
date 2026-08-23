@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--expected-world-size", type=int, default=16)
     parser.add_argument("--output-jsonl")
+    parser.add_argument(
+        "--profile-cuda-range",
+        action="store_true",
+        help="Bracket measured iterations with cudaProfilerStart/Stop.",
+    )
     return parser.parse_args()
 
 
@@ -542,7 +547,13 @@ def max_rank_time_ms(local_ms: float) -> float:
 
 
 def run_case(
-    layer, tensors, shared_stage, shared_buffer, warmup: int, repeat: int
+    layer,
+    tensors,
+    shared_stage,
+    shared_buffer,
+    warmup: int,
+    repeat: int,
+    profile_cuda_range: bool,
 ) -> dict:
     import torch
     import torch.distributed as dist
@@ -564,6 +575,8 @@ def run_case(
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     output = None
+    if profile_cuda_range:
+        torch.cuda.cudart().cudaProfilerStart()
     for _ in range(repeat):
         dist.barrier()
         torch.cuda.synchronize()
@@ -576,6 +589,8 @@ def run_case(
         wall_samples.append(
             max_rank_time_ms((time.perf_counter() - wall_started) * 1e3)
         )
+    if profile_cuda_range:
+        torch.cuda.cudart().cudaProfilerStop()
     assert output is not None
     assert torch.isfinite(output).all()
     gpu_samples.sort()
@@ -649,6 +664,7 @@ def main() -> int:
             shared_buffer,
             args.warmup,
             args.repeat,
+            args.profile_cuda_range,
         )
         result.update(
             **metadata,
