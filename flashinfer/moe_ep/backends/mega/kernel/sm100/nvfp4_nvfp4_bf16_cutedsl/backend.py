@@ -279,7 +279,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/clamp change nulls the frontend's compiled session,
         # changing the key and forcing a rebuild through the validated path.
-        shared_inputs = getattr(workspace, "_mega_shared_inputs", None)
+        shared_inputs = workspace._mega_shared_inputs
         fe = workspace.frontend_for_shared_inputs(shared_inputs)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:

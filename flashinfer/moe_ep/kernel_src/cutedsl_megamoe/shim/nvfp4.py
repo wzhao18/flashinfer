@@ -1299,6 +1299,7 @@ class MegaMoESymmBuffer:
 
     _frontend: MegaMoENvfp4Frontend
     _routed_frontend: Optional[MegaMoENvfp4Frontend] = None
+    _mega_shared_inputs: Optional[MegaMoESharedNvfp4Inputs] = None
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
 

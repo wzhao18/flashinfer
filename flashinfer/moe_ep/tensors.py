@@ -1,7 +1,7 @@
 """MoEEpTensors — the bundle of tensors `MoEEpLayer.forward()` consumes.
 
 `hidden_states` and `topk_ids` / `topk_weights` are required; the rest are
-optional outputs the backend may populate during dispatch/combine.
+backend-specific inputs or optional outputs populated during dispatch/combine.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ class MoEEpTensors:
     fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
+    # Opaque because the shared-expert ABI belongs to the optional NVFP4
+    # MegaMoE backend rather than the common tensor bundle.
     mega_shared_inputs: Optional[Any] = None
 
     @property
