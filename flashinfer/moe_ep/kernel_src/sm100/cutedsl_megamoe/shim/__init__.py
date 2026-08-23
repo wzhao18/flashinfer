@@ -131,12 +131,6 @@ from .bf16 import (
     create_dummy_inputs as create_dummy_bf16_inputs,
     get_symm_buffer_for_bf16_mega_moe,
 )
-from .bf16_shared import (
-    FusedBf16SituMlpConfig,
-    FusedBf16SituMlpFrontend,
-    fused_bf16_situ_mlp,
-)
-
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
 from .tuner import (
@@ -246,9 +240,6 @@ __all__ = [
     "bf16_mega_moe",
     "create_dummy_bf16_inputs",
     "get_symm_buffer_for_bf16_mega_moe",
-    "FusedBf16SituMlpConfig",
-    "FusedBf16SituMlpFrontend",
-    "fused_bf16_situ_mlp",
     # tuner
     "tuner",
     "CORRECTNESS_KNOBS",
