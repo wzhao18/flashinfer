@@ -93,12 +93,8 @@ def main() -> None:
     activation = torch.zeros(
         args.capacity, args.hidden, dtype=torch.bfloat16, device=device
     )
-    topk_idx = torch.full(
-        (args.capacity, 2), -1, dtype=torch.int64, device=device
-    )
-    topk_weights = torch.zeros(
-        args.capacity, 2, dtype=torch.float32, device=device
-    )
+    topk_idx = torch.full((args.capacity, 2), -1, dtype=torch.int64, device=device)
+    topk_weights = torch.zeros(args.capacity, 2, dtype=torch.float32, device=device)
     topk_dim = 1 if args.in_kernel_reduce else 2
     combine_output = torch.zeros(
         args.capacity,

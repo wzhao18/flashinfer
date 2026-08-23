@@ -329,9 +329,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(
-                inputs, zero_num_tokens=clear_tokens
-            )
+            thunk = fe.make_launch_thunk(inputs, zero_num_tokens=clear_tokens)
             mega = fe._mega
             key = (*key[:2], id(mega.compiled), *key[3:])
             state = (key, thunk, workspace.output_activation)

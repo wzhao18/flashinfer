@@ -451,12 +451,8 @@ def _run_mega_layer(
     shared_intermediate = int(
         os.environ.get("SHARED_TEST_INTERMEDIATE", problem["intermediate"])
     )
-    shared_hidden = int(
-        os.environ.get("SHARED_TEST_HIDDEN", problem["hidden"])
-    )
-    shared_capacity = int(
-        os.environ.get("SHARED_TEST_CAPACITY", problem["num_tokens"])
-    )
+    shared_hidden = int(os.environ.get("SHARED_TEST_HIDDEN", problem["hidden"]))
+    shared_capacity = int(os.environ.get("SHARED_TEST_CAPACITY", problem["num_tokens"]))
     config_extra = dict(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
@@ -684,8 +680,7 @@ def _run_mega_layer(
             **tensor_kwargs,
         )
         print(
-            f"rank {rank}: launching MegaMoE forward "
-            f"(shared_expert={shared_expert})",
+            f"rank {rank}: launching MegaMoE forward (shared_expert={shared_expert})",
             flush=True,
         )
         y_layer = mega.forward(t).clone()
@@ -751,9 +746,7 @@ def _run_mega_layer(
             ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
             problem["max_tokens"],
         )
-        untouched_tail = (
-            in_kernel_fc2_reduce and clear_tokens < problem["max_tokens"]
-        )
+        untouched_tail = in_kernel_fc2_reduce and clear_tokens < problem["max_tokens"]
         if untouched_tail:
             mega._workspace.output_activation[clear_tokens:].fill_(7.0)
         # Repeated forward on the same session: with no per-launch host reset
@@ -781,9 +774,7 @@ def _run_mega_layer(
                 shared_reference,
             )
         if untouched_tail:
-            assert torch.all(
-                mega._workspace.output_activation[clear_tokens:] == 7.0
-            )
+            assert torch.all(mega._workspace.output_activation[clear_tokens:] == 7.0)
         dist.barrier()
 
         if quantize_input:
@@ -822,13 +813,9 @@ def _run_mega_layer(
             y_routed_only = mega.forward(routed_only_t)
             torch.cuda.synchronize()
             if in_kernel_fc2_reduce:
-                _assert_ikr_close(
-                    y_routed_only, y_ref, topk=problem["topk"]
-                )
+                _assert_ikr_close(y_routed_only, y_ref, topk=problem["topk"])
             else:
-                torch.testing.assert_close(
-                    y_routed_only, y_ref, atol=0.0, rtol=0.0
-                )
+                torch.testing.assert_close(y_routed_only, y_ref, atol=0.0, rtol=0.0)
 
         if combine_dtype != "bf16":
             # Numerics sanity vs the exact bf16 combine wire: the quantized

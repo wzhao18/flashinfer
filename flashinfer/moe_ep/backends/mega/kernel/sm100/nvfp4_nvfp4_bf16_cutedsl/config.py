@@ -54,19 +54,14 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     knobs: dict | str | None = None
 
     def __post_init__(self) -> None:
-        if (self.shared_hidden_size is None) != (
-            self.shared_intermediate_size is None
-        ):
+        if (self.shared_hidden_size is None) != (self.shared_intermediate_size is None):
             raise ValueError(
-                "shared_hidden_size and shared_intermediate_size must be "
-                "set together."
+                "shared_hidden_size and shared_intermediate_size must be set together."
             )
         if self.shared_hidden_size is not None:
             assert self.shared_intermediate_size is not None
             if self.shared_hidden_size % 64 or self.shared_intermediate_size % 64:
-                raise ValueError(
-                    "shared expert dimensions must be multiples of 64."
-                )
+                raise ValueError("shared expert dimensions must be multiples of 64.")
         if self.activation not in ("swiglu", "situ"):
             raise ValueError(
                 f"activation must be 'swiglu' or 'situ', got {self.activation!r}."

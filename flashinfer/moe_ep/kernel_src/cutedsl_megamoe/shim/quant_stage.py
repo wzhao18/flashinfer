@@ -177,8 +177,7 @@ def fused_quant_stage(
             f"for hidden={hidden}, {quant_type}."
         )
     if sf_layout == "blocked_128x4" and (
-        x_sf_out.shape[0] < ((num_tokens + 127) // 128) * 128
-        or x_sf_out.shape[0] % 128
+        x_sf_out.shape[0] < ((num_tokens + 127) // 128) * 128 or x_sf_out.shape[0] % 128
     ):
         raise ValueError(
             "blocked_128x4 x_sf must provide a 128-row-padded physical plane"

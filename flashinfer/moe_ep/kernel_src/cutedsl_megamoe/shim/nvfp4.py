@@ -1150,12 +1150,17 @@ class MegaMoENvfp4Frontend:
         )
         for name in shared_names:
             tensor = getattr(shared, name) if shared is not None else None
-            assumed_align = 4 if name in {
-                "fc1_alpha",
-                "fc2_alpha",
-                "fc1_norm_const",
-                "fc1_done_counter",
-            } else 16
+            assumed_align = (
+                4
+                if name
+                in {
+                    "fc1_alpha",
+                    "fc2_alpha",
+                    "fc1_norm_const",
+                    "fc1_done_counter",
+                }
+                else 16
+            )
             kwargs[f"shared_{name}"] = (
                 self._to_cute(tensor, assumed_align=assumed_align)
                 if tensor is not None
@@ -1481,9 +1486,7 @@ def get_symm_buffer_for_mega_moe(
         local_only=local_only,
     )
     sym_roots.append(x_sf_root)
-    topk_idx = sym_zeros(
-        (num_max_tokens, num_topk), torch.int64, local_only=local_only
-    )
+    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64, local_only=local_only)
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
     # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
     # tail, but start from the masked state so a partial first staging is safe.
