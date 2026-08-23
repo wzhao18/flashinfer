@@ -94,9 +94,7 @@ def main() -> None:
         activation_sf=shared_activation_sf,
         fc1_weight=shared_fc1[0],
         fc1_weight_sf=shared_fc1[1],
-        fc1_output=torch.empty(
-            tokens, shared_down // 2, dtype=fp4, device="cuda"
-        ),
+        fc1_output=torch.empty(tokens, shared_down // 2, dtype=fp4, device="cuda"),
         fc1_output_sf=torch.zeros(
             sf_rows, sf_cols, dtype=torch.float8_e4m3fn, device="cuda"
         ),
@@ -139,9 +137,7 @@ def main() -> None:
         shared.fc1_norm_const.item(),
         flush=True,
     )
-    reference_thunk = nvfp4_mega_launch_thunk(
-        shared_fc1, shared_fc2, shared_buffer
-    )
+    reference_thunk = nvfp4_mega_launch_thunk(shared_fc1, shared_fc2, shared_buffer)
     shared_activation_before = shared.activation.view(torch.uint8).clone()
     shared_activation_sf_before = shared.activation_sf.view(torch.uint8).clone()
     reference_thunk()
@@ -149,15 +145,10 @@ def main() -> None:
     print("standalone reference passed", flush=True)
     print(
         "standalone input byte changes=",
+        int((shared.activation.view(torch.uint8) != shared_activation_before).sum()),
         int(
             (
-                shared.activation.view(torch.uint8) != shared_activation_before
-            ).sum()
-        ),
-        int(
-            (
-                shared.activation_sf.view(torch.uint8)
-                != shared_activation_sf_before
+                shared.activation_sf.view(torch.uint8) != shared_activation_sf_before
             ).sum()
         ),
         flush=True,
@@ -181,15 +172,12 @@ def main() -> None:
     reference_metadata_spec = reference_kernel._local_region_by_name[
         "token_src_metadata"
     ]
-    reference_metadata_offset = reference_kernel._local_offsets[
-        "token_src_metadata"
-    ]
+    reference_metadata_offset = reference_kernel._local_offsets["token_src_metadata"]
     reference_metadata_bytes = (
         reference_metadata_spec.shape[0] * reference_metadata_spec.shape[1]
     )
     reference_metadata = reference_workspace[
-        reference_metadata_offset : reference_metadata_offset
-        + reference_metadata_bytes
+        reference_metadata_offset : reference_metadata_offset + reference_metadata_bytes
     ].reshape(reference_metadata_spec.shape)
     reference_token_ids = (
         reference_metadata[:tokens].contiguous().view(torch.int32)[:, 0].long()
@@ -336,10 +324,7 @@ def main() -> None:
         (shared.output_activation.float() - reference.float()).abs().max().item(),
         "NRMSE=",
         (
-            (shared.output_activation.float() - reference.float())
-            .pow(2)
-            .mean()
-            .sqrt()
+            (shared.output_activation.float() - reference.float()).pow(2).mean().sqrt()
             / reference.float().pow(2).mean().sqrt()
         ).item(),
         flush=True,

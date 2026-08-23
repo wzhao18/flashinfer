@@ -76,19 +76,25 @@ def main() -> None:
             preprocess_mega_weights,
         )
 
-        gate = torch.randn(
-            args.intermediate,
-            args.hidden,
-            device="cuda",
-            dtype=torch.bfloat16,
-        ) / 64
+        gate = (
+            torch.randn(
+                args.intermediate,
+                args.hidden,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 64
+        )
         up = torch.randn_like(gate) / 64
-        down = torch.randn(
-            args.hidden,
-            args.intermediate,
-            device="cuda",
-            dtype=torch.bfloat16,
-        ) / 64
+        down = (
+            torch.randn(
+                args.hidden,
+                args.intermediate,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 64
+        )
         fc1, fc2 = preprocess_mega_weights(
             MoEWeightPack(
                 w13=torch.cat((gate, up), dim=0).unsqueeze(0),
@@ -104,15 +110,9 @@ def main() -> None:
     symm.topk_weights.zero_()
     symm.topk_weights[: args.tokens].fill_(1.0)
     launch = nvfp4_mega_launch_thunk(fc1, fc2, symm)
-    hidden = torch.randn(
-        args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16
-    )
-    topk_ids = torch.zeros(
-        args.tokens, 1, device="cuda", dtype=torch.int64
-    )
-    topk_weights = torch.ones(
-        args.tokens, 1, device="cuda", dtype=torch.float32
-    )
+    hidden = torch.randn(args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.zeros(args.tokens, 1, device="cuda", dtype=torch.int64)
+    topk_weights = torch.ones(args.tokens, 1, device="cuda", dtype=torch.float32)
 
     def stage() -> None:
         stage_mega_moe_inputs(
@@ -136,9 +136,7 @@ def main() -> None:
         gate, up, down = reference_weights
         gate_output = hidden @ gate.t()
         up_output = hidden @ up.t()
-        gate_output = 4.0 * torch.tanh(gate_output / 4.0) * torch.sigmoid(
-            gate_output
-        )
+        gate_output = 4.0 * torch.tanh(gate_output / 4.0) * torch.sigmoid(gate_output)
         up_output = 25.0 * torch.tanh(up_output / 25.0)
         expected = (gate_output * up_output).to(torch.bfloat16) @ down.t()
         relative_l2 = (
