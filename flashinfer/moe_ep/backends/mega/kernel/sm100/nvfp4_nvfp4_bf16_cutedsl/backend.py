@@ -52,6 +52,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_state: tuple | None = None
+        self._active_epilogue: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+            None
+        )
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -235,12 +238,15 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
-        if t.fc1_alpha is not None:
-            workspace.fc1_alpha.copy_(t.fc1_alpha)
-        if t.fc2_alpha is not None:
-            workspace.fc2_alpha.copy_(t.fc2_alpha)
-        if t.fc1_norm_const is not None:
-            workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+        self._active_epilogue = (
+            t.fc1_alpha if t.fc1_alpha is not None else workspace.fc1_alpha,
+            t.fc2_alpha if t.fc2_alpha is not None else workspace.fc2_alpha,
+            (
+                t.fc1_norm_const
+                if t.fc1_norm_const is not None
+                else workspace.fc1_norm_const
+            ),
+        )
         if t.shared_hidden_states is not None:
             assert t.shared_expert_weights is not None
             assert t.shared_expert_output is not None
@@ -306,6 +312,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # graph. A knobs/clamp change nulls the frontend's compiled session,
         # changing the key and forcing a rebuild through the validated path.
         shared_inputs = workspace._shared_inputs
+        active_epilogue = self._active_epilogue
+        if active_epilogue is None:
+            raise ValueError("compute() requires stage_inputs() to run first")
+        fc1_alpha, fc2_alpha, fc1_norm_const = active_epilogue
         fe = workspace._frontend
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
@@ -324,6 +334,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             id(mega.compiled) if mega is not None and mega.compiled else None,
             stream,
             clear_tokens,
+            tuple(
+                (tensor.data_ptr(), tuple(tensor.shape))
+                for tensor in active_epilogue
+            ),
             tuple(
                 (tensor.data_ptr(), tuple(tensor.shape))
                 for tensor in vars(shared_inputs).values()
@@ -347,9 +361,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 fc1_weight_sf=transformed_weights[0][1],
                 fc2_weight=transformed_weights[1][0],
                 fc2_weight_sf=transformed_weights[1][1],
-                fc1_alpha=workspace.fc1_alpha,
-                fc2_alpha=workspace.fc2_alpha,
-                fc1_norm_const=workspace.fc1_norm_const,
+                fc1_alpha=fc1_alpha,
+                fc2_alpha=fc2_alpha,
+                fc1_norm_const=fc1_norm_const,
                 output_activation=workspace.output_activation,
                 shared=shared_inputs,
             )
