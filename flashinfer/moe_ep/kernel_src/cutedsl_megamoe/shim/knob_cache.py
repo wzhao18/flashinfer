@@ -113,14 +113,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
         return []
     # Drop non-dict elements too: lookup_knobs/record_knobs call e.get() on
     # every entry, and a corrupted-but-valid-JSON cache must degrade, not raise.
-    normalized = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        # Version-1 entries predate the activation selector and are SwiGLU.
-        entry.setdefault("activation", "swiglu")
-        normalized.append(entry)
-    return normalized
+    return [e for e in entries if isinstance(e, dict)]
 
 
 def _knobs_to_json(knobs: Dict[str, Any]) -> Dict[str, Any]:

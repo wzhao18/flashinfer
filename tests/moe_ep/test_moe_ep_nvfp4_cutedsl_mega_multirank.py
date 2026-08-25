@@ -168,15 +168,13 @@ def _mega_problem(
     *,
     num_tokens: int = 64,
     max_tokens: int = 64,
-    activation: str | None = None,
+    activation: str = "swiglu",
 ):
     hidden = 2048
     intermediate = 1024
     num_experts = 8
     topk = 4
     fast_math = True
-    if activation is None:
-        activation = "swiglu"
     gate_up_clamp = None if activation == "situ" else 10.0
     situ_beta = 7.0 if activation == "situ" else None
     situ_linear_beta = 1.0 if activation == "situ" else None
@@ -466,13 +464,11 @@ def _run_mega_layer(
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
     )
-    print(f"rank {rank}: bootstrapping MegaMoE runtime", flush=True)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
     )
 
-    print(f"rank {rank}: MegaMoE runtime ready", flush=True)
     try:
         shared_hidden_states = None
         shared_weights = None
@@ -616,12 +612,7 @@ def _run_mega_layer(
             shared_expert_output=shared_output,
             **tensor_kwargs,
         )
-        print(
-            f"rank {rank}: launching MegaMoE forward (shared_expert={shared_expert})",
-            flush=True,
-        )
         y_layer = mega.forward(t).clone()
-        print(f"rank {rank}: MegaMoE forward complete", flush=True)
         clear_tokens = min(
             ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
             problem["max_tokens"],

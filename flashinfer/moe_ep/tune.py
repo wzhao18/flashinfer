@@ -145,16 +145,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dtype == "nvfp4":
         from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-            run_tuning as run_nvfp4_tuning,
+            run_tuning,
         )
-
-        return run_nvfp4_tuning(args)
-
-    from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
-        run_tuning as run_mxfp8_tuning,
-    )
-
-    return run_mxfp8_tuning(args)
+    else:
+        from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
+            run_tuning,
+        )
+    return run_tuning(args)
 
 
 if __name__ == "__main__":
