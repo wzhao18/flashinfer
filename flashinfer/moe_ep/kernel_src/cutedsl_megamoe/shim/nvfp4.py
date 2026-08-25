@@ -244,6 +244,8 @@ class MegaMoENvfp4Config:
 
 @dataclasses.dataclass
 class MegaMoESharedNvfp4Inputs:
+    """Rank-local shared-expert tensors fused into a MegaMoE launch."""
+
     activation: torch.Tensor
     activation_sf: torch.Tensor
     fc1_weight: torch.Tensor
@@ -480,7 +482,7 @@ class MegaMoENvfp4Frontend:
         # count: _slice_inputs slices from row 0, so the sliced views keep
         # these data_ptrs and the count captures the shape.
         t = inputs
-        shared_key = ()
+        shared_key: tuple[object, ...] = ()
         if t.shared is not None:
             shared_key = tuple(
                 key_part
@@ -1002,11 +1004,11 @@ class MegaMoENvfp4Frontend:
                     torch.bfloat16,
                 ),
             )
-            for name, tensor, shape, dtype in shared_shapes:
+            for name, tensor, shared_shape, dtype in shared_shapes:
                 _require_cuda(f"shared.{name}", tensor)
-                if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                if tuple(tensor.shape) != shared_shape or tensor.dtype != dtype:
                     raise ValueError(
-                        f"shared.{name} must have shape {shape} and dtype "
+                        f"shared.{name} must have shape {shared_shape} and dtype "
                         f"{dtype}, got {tuple(tensor.shape)} and {tensor.dtype}."
                     )
             for name, tensor, minimum_rows, minimum_cols in (

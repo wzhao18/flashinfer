@@ -163,14 +163,20 @@ def _make_packed_weights(
 
 
 def _mega_problem(
-    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+    rank: int,
+    world_size: int,
+    *,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    activation: str | None = None,
 ):
     hidden = int(os.environ.get("MEGA_TEST_HIDDEN", "2048"))
     intermediate = int(os.environ.get("MEGA_TEST_INTERMEDIATE", "1024"))
     num_experts = int(os.environ.get("MEGA_TEST_NUM_EXPERTS", "8"))
     topk = int(os.environ.get("MEGA_TEST_TOPK", "4"))
     fast_math = True
-    activation = os.environ.get("MEGA_TEST_ACTIVATION", "swiglu")
+    if activation is None:
+        activation = os.environ.get("MEGA_TEST_ACTIVATION", "swiglu")
     gate_up_clamp = None if activation == "situ" else 10.0
     situ_beta = 7.0 if activation == "situ" else None
     situ_linear_beta = 1.0 if activation == "situ" else None
@@ -414,6 +420,7 @@ def _run_mega_layer(
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
     shared_expert: bool = False,
+    activation: str | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -439,7 +446,11 @@ def _run_mega_layer(
     ensure_moe_ep_cuda_device(bootstrap)
 
     problem = _mega_problem(
-        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+        rank,
+        world_size,
+        num_tokens=num_tokens,
+        max_tokens=max_tokens,
+        activation=activation,
     )
     if shared_expert and os.environ.get("SHARED_TEST_DISABLE_ROUTED") == "1":
         problem["topk_ids"].fill_(-1)
@@ -487,7 +498,7 @@ def _run_mega_layer(
     try:
         shared_inputs = None
         shared_reference = None
-        shared_buffer = None
+        shared_session = None
         if shared_expert:
             from flashinfer.moe_ep import (
                 Nvfp4CutedslSharedExpertSession,
@@ -535,7 +546,6 @@ def _run_mega_layer(
             )
             shared_session.stage(shared_hidden_states, integrated=True)
             shared_inputs = shared_session.integrated_inputs(shared_weights)
-            shared_buffer = shared_session.buffer
             shared_inputs.output_activation.zero_()
 
         if quantize_input:
@@ -659,7 +669,7 @@ def _run_mega_layer(
             torch.cuda.synchronize()
             print(f"rank {rank}: shared reference complete", flush=True)
             shared_reference = reference_session.output().clone()
-            reference_session.buffer.destroy()
+            reference_session.destroy()
         clear_tokens = min(
             ((max(problem["num_tokens"], 1) + 63) // 64) * 64,
             problem["max_tokens"],
@@ -755,8 +765,8 @@ def _run_mega_layer(
                 f"vs bf16 combine exceeds {band}"
             )
         mega.destroy()
-        if shared_buffer is not None:
-            shared_buffer.destroy()
+        if shared_session is not None:
+            shared_session.destroy()
         return rank
     finally:
         finalize_moe_ep_runtime(runtime)
@@ -801,6 +811,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert():
         max_tokens=max_tokens,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         shared_expert=True,
+        activation="situ",
     )
     print(f"rank {rank}: shared expert matches the standalone NVFP4 reference")
 

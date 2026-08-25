@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """SiTU activation adapter for the raw NVFP4 MegaMoE kernel.
 
-The kernel-team source is immutable and resolves its decorated epilogue method
-while CuTeDSL traces the kernel.  The shim therefore substitutes the method
-only inside a serialized compile scope and restores it before returning; the
-compiled runtime has no Python patch or activation dispatch.
+The raw kernel resolves its decorated epilogue method while CuTeDSL traces it.
+The shim substitutes that method only inside a serialized compile scope and
+restores it before returning; runtime launches use the compiled SiTU path.
 """
 
 from __future__ import annotations
@@ -64,25 +63,25 @@ def _alpha_situ(
     for name, tensor in (("gate_rmem", gate_rmem), ("up_rmem", up_rmem)):
         if cutlass.const_expr(tensor.element_type is not cutlass.Float32):
             raise TypeError(
-                f"alpha_swiglu_clamp: {name} must be Float32, got {tensor.element_type}"
+                f"alpha_situ: {name} must be Float32, got {tensor.element_type}"
             )
         if cutlass.const_expr(tensor.memspace != AddressSpace.rmem):
             raise ValueError(
-                f"alpha_swiglu_clamp: {name} must be a register tensor, "
+                f"alpha_situ: {name} must be a register tensor, "
                 f"got address space {tensor.memspace}"
             )
         if cutlass.const_expr(cute.rank(tensor) != 1):
             raise ValueError(
-                f"alpha_swiglu_clamp: {name} must be 1D, got rank {cute.rank(tensor)}"
+                f"alpha_situ: {name} must be 1D, got rank {cute.rank(tensor)}"
             )
         if cutlass.const_expr(cute.size(tensor) % 2 != 0):
             raise ValueError(
-                f"alpha_swiglu_clamp: {name} element count must be even, "
+                f"alpha_situ: {name} element count must be even, "
                 f"got {cute.size(tensor)}"
             )
     if cutlass.const_expr(cute.size(gate_rmem) != cute.size(up_rmem)):
         raise ValueError(
-            "alpha_swiglu_clamp: gate_rmem and up_rmem must have equal "
+            "alpha_situ: gate_rmem and up_rmem must have equal "
             f"size, got {cute.size(gate_rmem)} vs {cute.size(up_rmem)}"
         )
 

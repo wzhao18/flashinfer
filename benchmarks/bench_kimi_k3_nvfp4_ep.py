@@ -609,7 +609,7 @@ def main() -> int:
 
     layer.destroy()
     if shared_state is not None:
-        shared_state[0].buffer.destroy()
+        shared_state[0].destroy()
     dist.destroy_process_group()
     return 0
 

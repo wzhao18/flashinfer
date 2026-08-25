@@ -31,7 +31,7 @@ class Nvfp4CutedslSharedExpertSession:
     Args:
         max_num_tokens: Maximum active tokens in one invocation.
         hidden_size: Input and output hidden dimension.
-        intermediate_size: Combined shared-expert intermediate dimension.
+        intermediate_size: Shared-expert output width after SiTU.
         num_sms: SM budget for standalone local execution.
         situ_beta: SiTU gate clamp parameter.
         situ_linear_beta: Optional SiTU linear clamp parameter.
@@ -47,8 +47,20 @@ class Nvfp4CutedslSharedExpertSession:
         situ_beta: float,
         situ_linear_beta: float | None,
     ) -> None:
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be positive.")
+        if hidden_size % 64 or intermediate_size % 64:
+            raise ValueError(
+                "hidden_size and intermediate_size must be multiples of 64."
+            )
+        if num_sms < 2:
+            raise ValueError("num_sms must be at least 2.")
+
         self.max_num_tokens = max_num_tokens
+        self.hidden_size = hidden_size
         self.active_num_tokens = 0
+        self._integrated_staging: bool | None = None
+        self._destroyed = False
         self.buffer = get_symm_buffer_for_mega_moe(
             1,
             max_num_tokens,
@@ -87,13 +99,21 @@ class Nvfp4CutedslSharedExpertSession:
             device="cuda",
         )
         self.fc1_done_counter = torch.zeros(
-            max(max_num_tokens, 1), dtype=torch.int32, device="cuda"
+            max_num_tokens, dtype=torch.int32, device="cuda"
         )
         self._thunks: dict[tuple[int, ...], Callable[[], None]] = {}
 
     def stage(self, hidden_states: torch.Tensor, *, integrated: bool) -> None:
         """Quantize active input rows into this session's workspace."""
+        self._ensure_live()
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
+            raise ValueError(
+                "Shared-expert input must have shape "
+                f"(num_tokens, {self.hidden_size}), got {tuple(hidden_states.shape)}."
+            )
         num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            raise ValueError("Shared-expert input must contain at least one token.")
         if num_tokens > self.max_num_tokens:
             raise ValueError(
                 f"Shared-expert input has {num_tokens} tokens, but the session "
@@ -123,11 +143,13 @@ class Nvfp4CutedslSharedExpertSession:
                 self.buffer.topk_weights,
             )
         self.active_num_tokens = num_tokens
+        self._integrated_staging = integrated
 
     def integrated_inputs(
         self, weights: TransformedMegaWeights
     ) -> MegaMoESharedNvfp4Inputs:
         """Build active views consumed by the distributed fused launch."""
+        self._ensure_staged(integrated=True)
         fc1, fc2 = weights
         num_tokens = self.active_num_tokens
         scale_rows = _ceil_div(num_tokens, 128) * 128
@@ -143,16 +165,18 @@ class Nvfp4CutedslSharedExpertSession:
             fc1_alpha=self.buffer.fc1_alpha,
             fc2_alpha=self.buffer.fc2_alpha,
             fc1_norm_const=self.buffer.fc1_norm_const,
-            fc1_done_counter=self.fc1_done_counter[: max(num_tokens, 1)],
+            fc1_done_counter=self.fc1_done_counter[:num_tokens],
             output_activation=self.buffer.output_activation[:num_tokens],
         )
 
     def output(self) -> torch.Tensor:
         """Return the active output view."""
+        self._ensure_staged()
         return self.buffer.output_activation[: self.active_num_tokens]
 
     def run(self, weights: TransformedMegaWeights) -> torch.Tensor:
         """Launch the standalone local shared expert for staged inputs."""
+        self._ensure_staged(integrated=False)
         fc1, fc2 = weights
         key = (
             *(tensor.data_ptr() for pair in weights for tensor in pair),
@@ -164,3 +188,23 @@ class Nvfp4CutedslSharedExpertSession:
             self._thunks[key] = thunk
         thunk()
         return self.output()
+
+    def destroy(self) -> None:
+        """Release the session's local MegaMoE workspace."""
+        if self._destroyed:
+            return
+        self._thunks.clear()
+        self.buffer.destroy()
+        self._destroyed = True
+
+    def _ensure_live(self) -> None:
+        if self._destroyed:
+            raise RuntimeError("Shared-expert session has been destroyed.")
+
+    def _ensure_staged(self, *, integrated: bool | None = None) -> None:
+        self._ensure_live()
+        if self._integrated_staging is None:
+            raise RuntimeError("stage() must be called before using the session.")
+        if integrated is not None and self._integrated_staging != integrated:
+            mode = "integrated" if integrated else "standalone"
+            raise RuntimeError(f"Inputs must be staged for {mode} execution.")
