@@ -1815,7 +1815,10 @@ def nvfp4_mega_moe(
         shared=symm_buffer._shared_inputs,
     )
 
-    # The persistent kernel's cross-rank token addressing is capacity-specialized.
+    # The kernel reduces the top-k combine internally and writes the final 2D
+    # (T, hidden) output; no host-side form-A reduction is needed. Launch the
+    # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
+    # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
@@ -1992,7 +1995,6 @@ def create_dummy_inputs(
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
-    knobs: Optional[dict] = None,
     seed: int = 0,
 ) -> tuple[
     torch.Tensor,
@@ -2047,7 +2049,6 @@ def create_dummy_inputs(
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
-        knobs=knobs,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(

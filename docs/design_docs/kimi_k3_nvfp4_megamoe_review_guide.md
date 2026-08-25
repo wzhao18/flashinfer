@@ -208,8 +208,8 @@ while the existing row-major path remains unchanged.
 #### `flashinfer/moe_ep/kernel_src/cutedsl_megamoe/shim/knob_cache.py`
 
 Adds activation type to the tuning-cache identity, preventing a SwiGLU winner
-from being reused for SiTU or vice versa. Existing version-1 entries are
-normalized to `activation="swiglu"` for backward compatibility.
+from being reused for SiTU or vice versa. Entries without an activation no
+longer match.
 
 #### `flashinfer/moe_ep/kernel_src/cutedsl_megamoe/shim/autotune.py`
 

@@ -465,7 +465,7 @@ def run_case(
     import torch.distributed as dist
 
     def invoke():
-        if getattr(layer, "supports_output_view", False):
+        if layer.supports_output_view:
             return layer.forward(tensors, return_workspace_view=True)
         return layer.forward(tensors)
 
