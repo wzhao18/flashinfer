@@ -429,9 +429,36 @@ class MegaMoENvfp4Frontend:
         ``zero_num_tokens`` limits that clear to a leading row extent without
         changing the capacity-specialized kernel launch.
         """
+        prepare, launch = self.make_launch_thunks(
+            inputs,
+            num_tokens=num_tokens,
+            zero_num_tokens=zero_num_tokens,
+        )
+
+        def thunk() -> None:
+            prepare()
+            launch()
+
+        return thunk
+
+    def make_launch_thunks(
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+        zero_num_tokens: Optional[int] = None,
+    ) -> tuple[Callable[[], None], Callable[[], None]]:
+        """Return separate preparation and persistent-kernel launch thunks.
+
+        This split form lets benchmarks time the persistent launch without
+        silently including its required output and counter clears. Production
+        callers should normally use :meth:`make_launch_thunk` so stream
+        ordering is preserved automatically.
+        """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
-            return lambda: None
+            no_op = lambda: None
+            return no_op, no_op
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
@@ -440,37 +467,29 @@ class MegaMoENvfp4Frontend:
             if launch_inputs.shared is not None
             else None
         )
+        output_activation = launch_inputs.output_activation
+        if self.config.fc2_reduces_topk and zero_num_tokens is not None:
+            if (
+                zero_num_tokens < 1
+                or zero_num_tokens > inputs.output_activation.shape[0]
+            ):
+                raise ValueError(
+                    "zero_num_tokens must be in "
+                    f"[1, {inputs.output_activation.shape[0]}], "
+                    f"got {zero_num_tokens}."
+                )
+            output_activation = inputs.output_activation[:zero_num_tokens]
 
-        if self.config.fc2_reduces_topk:
-            output_activation = launch_inputs.output_activation
-            if zero_num_tokens is not None:
-                if (
-                    zero_num_tokens < 1
-                    or zero_num_tokens > inputs.output_activation.shape[0]
-                ):
-                    raise ValueError(
-                        "zero_num_tokens must be in "
-                        f"[1, {inputs.output_activation.shape[0]}], "
-                        f"got {zero_num_tokens}."
-                    )
-                output_activation = inputs.output_activation[:zero_num_tokens]
-
-            def thunk() -> None:
-                if shared_fc1_done_counter is not None:
-                    shared_fc1_done_counter.zero_()
+        def prepare() -> None:
+            if shared_fc1_done_counter is not None:
+                shared_fc1_done_counter.zero_()
+            if self.config.fc2_reduces_topk:
                 output_activation.zero_()
-                # The kernel's opening cross-rank dispatch barrier orders
-                # every stream-local clear before any peer REDG store.
-                compiled(**runtime_kwargs)
 
-        else:
+        def launch() -> None:
+            compiled(**runtime_kwargs)
 
-            def thunk() -> None:
-                if shared_fc1_done_counter is not None:
-                    shared_fc1_done_counter.zero_()
-                compiled(**runtime_kwargs)
-
-        return thunk
+        return prepare, launch
 
     @staticmethod
     def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:

@@ -13,8 +13,9 @@ Launch one process per GPU.  Kimi-K3 DEP16 on GB300 uses four 4-GPU nodes::
 Global token counts are distributed over EP ranks using the same rectangular
 padding required by data-parallel decode.  Rows beyond the requested global
 count are assigned no routed experts.  CSV output records both requested and
-padded token counts. CUDA events measure the distributed GPU critical path;
-synchronized wall time is reported separately to expose launch overhead.
+padded token counts. CUDA events separately measure the complete provider
+invocation and, for MegaMoE, the persistent kernel. Synchronized wall time is
+reported separately to expose launch overhead.
 """
 
 from __future__ import annotations
@@ -436,6 +437,10 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared_weights):
     if active_tokens < tokens_per_rank:
         topk_ids[active_tokens:].fill_(-1)
         topk_weights[active_tokens:].zero_()
+    local_experts = 896 // world_size
+    fc1_alpha = torch.ones(local_experts, dtype=torch.float32, device="cuda")
+    fc2_alpha = torch.ones(local_experts, dtype=torch.float32, device="cuda")
+    fc1_norm_const = torch.ones(local_experts, dtype=torch.float32, device="cuda")
     shared_hidden_states = None
     shared_expert_output = None
     if shared_weights is not None:
@@ -451,6 +456,9 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared_weights):
         hidden_states=hidden,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        fc1_norm_const=fc1_norm_const,
         shared_hidden_states=shared_hidden_states,
         shared_expert_weights=shared_weights,
         shared_expert_output=shared_expert_output,
@@ -472,9 +480,7 @@ def all_rank_values(local_value: float) -> list[float]:
     import torch.distributed as dist
 
     value = torch.tensor(local_value, dtype=torch.float64, device="cuda")
-    values = torch.empty(
-        dist.get_world_size(), dtype=torch.float64, device="cuda"
-    )
+    values = torch.empty(dist.get_world_size(), dtype=torch.float64, device="cuda")
     dist.all_gather_into_tensor(values, value)
     return values.cpu().tolist()
 
@@ -486,6 +492,113 @@ def sum_rank_value(local_value: float) -> float:
     value = torch.tensor(local_value, dtype=torch.float64, device="cuda")
     dist.all_reduce(value, op=dist.ReduceOp.SUM)
     return value.item()
+
+
+def make_mega_kernel_thunks(layer, num_tokens: int):
+    """Build separate reset and persistent-launch thunks for a warmed layer."""
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import MegaMoENvfp4Inputs
+
+    workspace = layer._workspace
+    transformed = layer._transformed
+    if workspace is None or transformed is None:
+        raise RuntimeError("MegaMoE layer must be warmed before kernel timing")
+    active_epilogue = getattr(layer._kernel, "_active_epilogue", None)
+    if active_epilogue is None:
+        active_epilogue = (
+            workspace.fc1_alpha,
+            workspace.fc2_alpha,
+            workspace.fc1_norm_const,
+        )
+    fc1_alpha, fc2_alpha, fc1_norm_const = active_epilogue
+    inputs = MegaMoENvfp4Inputs(
+        activation=workspace.x,
+        activation_sf=workspace.x_sf,
+        topk_idx=workspace.topk_idx,
+        topk_weights=workspace.topk_weights,
+        fc1_weight=transformed[0][0],
+        fc1_weight_sf=transformed[0][1],
+        fc2_weight=transformed[1][0],
+        fc2_weight_sf=transformed[1][1],
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        fc1_norm_const=fc1_norm_const,
+        output_activation=workspace.output_activation,
+        shared=workspace._shared_inputs,
+    )
+    clear_tokens = min(
+        ((max(num_tokens, 1) + 63) // 64) * 64,
+        workspace.x.shape[0],
+    )
+    return workspace._frontend.make_launch_thunks(
+        inputs,
+        zero_num_tokens=clear_tokens,
+    )
+
+
+def measure_gpu(
+    invoke,
+    *,
+    prepare,
+    warmup: int,
+    repeat: int,
+    cuda_graph: bool,
+    capture_invoke_factory=None,
+) -> tuple[list[float], list[float], Any]:
+    """Measure local and slowest-EP-rank CUDA latency for one callable."""
+    import torch
+    import torch.distributed as dist
+
+    output = None
+    for _ in range(warmup):
+        prepare()
+        output = invoke()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    graph = None
+    graph_start = None
+    graph_end = None
+    if cuda_graph:
+        prepare()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        graph_start = torch.cuda.Event(enable_timing=True, external=True)
+        graph_end = torch.cuda.Event(enable_timing=True, external=True)
+        with torch.cuda.graph(graph):
+            graph_invoke = (
+                capture_invoke_factory()
+                if capture_invoke_factory is not None
+                else invoke
+            )
+            graph_start.record()
+            output = graph_invoke()
+            graph_end.record()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    eager_start = torch.cuda.Event(enable_timing=True)
+    eager_end = torch.cuda.Event(enable_timing=True)
+    local_samples = []
+    critical_samples = []
+    for _ in range(repeat):
+        prepare()
+        torch.cuda.synchronize()
+        dist.barrier()
+        if graph is None:
+            eager_start.record()
+            output = invoke()
+            eager_end.record()
+            eager_end.synchronize()
+            local_ms = eager_start.elapsed_time(eager_end)
+        else:
+            graph.replay()
+            assert graph_start is not None and graph_end is not None
+            graph_end.synchronize()
+            local_ms = graph_start.elapsed_time(graph_end)
+        local_samples.append(local_ms)
+        critical_samples.append(max_rank_time_ms(local_ms))
+    return local_samples, critical_samples, output
 
 
 def run_case(
@@ -504,45 +617,60 @@ def run_case(
             return layer.forward(tensors, return_workspace_view=True)
         return layer.forward(tensors)
 
-    for _ in range(warmup):
-        invoke()
-    torch.cuda.synchronize()
-    dist.barrier()
+    invocation_local, invocation_critical, output = measure_gpu(
+        invoke,
+        prepare=lambda: None,
+        warmup=warmup,
+        repeat=repeat,
+        cuda_graph=cuda_graph,
+    )
 
-    graph = None
-    graph_output = None
-    if cuda_graph:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = invoke()
-        torch.cuda.synchronize()
-        dist.barrier()
+    kernel_local = None
+    kernel_critical = None
+    preparation_local = None
+    preparation_critical = None
+    if layer.supports_output_view:
+        quantize_input = layer._resolve_quantize_input(tensors)
 
-    def measured_invoke():
-        if graph is None:
-            return invoke()
-        graph.replay()
-        return graph_output
+        def prepare_only():
+            layer._kernel.stage_inputs(
+                tensors,
+                layer._workspace,
+                quantize_input=quantize_input,
+            )
+            prepare_launch, _ = make_mega_kernel_thunks(layer, tensors.num_tokens)
+            prepare_launch()
 
-    local_gpu_samples = []
-    critical_gpu_samples = []
+        preparation_local, preparation_critical, _ = measure_gpu(
+            prepare_only,
+            prepare=lambda: None,
+            warmup=warmup,
+            repeat=repeat,
+            cuda_graph=cuda_graph,
+        )
+        prepare_kernel, launch_kernel = make_mega_kernel_thunks(
+            layer, tensors.num_tokens
+        )
+        kernel_local, kernel_critical, _ = measure_gpu(
+            launch_kernel,
+            prepare=prepare_kernel,
+            warmup=warmup,
+            repeat=repeat,
+            cuda_graph=cuda_graph,
+            capture_invoke_factory=lambda: make_mega_kernel_thunks(
+                layer, tensors.num_tokens
+            )[1],
+        )
+
     wall_samples = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    output = None
     if profile_cuda_range:
         torch.cuda.cudart().cudaProfilerStart()
     for _ in range(repeat):
         dist.barrier()
         torch.cuda.synchronize()
-        start.record()
         wall_started = time.perf_counter()
-        output = measured_invoke()
-        end.record()
-        end.synchronize()
-        local_gpu_ms = start.elapsed_time(end)
-        local_gpu_samples.append(local_gpu_ms)
-        critical_gpu_samples.append(max_rank_time_ms(local_gpu_ms))
+        output = invoke()
+        torch.cuda.synchronize()
         wall_samples.append(
             max_rank_time_ms((time.perf_counter() - wall_started) * 1e3)
         )
@@ -561,23 +689,33 @@ def run_case(
         shared_float = tensors.shared_expert_output.float()
         shared_output_sum = sum_rank_value(shared_float.sum().item())
         shared_output_l2_sq = sum_rank_value(shared_float.square().sum().item())
-    local_gpu_samples.sort()
-    critical_gpu_samples.sort()
+    invocation_local.sort()
+    invocation_critical.sort()
+    if kernel_local is not None:
+        kernel_local.sort()
+        assert kernel_critical is not None
+        kernel_critical.sort()
+        assert preparation_local is not None
+        assert preparation_critical is not None
+        preparation_local.sort()
+        preparation_critical.sort()
     wall_samples.sort()
 
     def percentile(samples, fraction):
         return samples[max(0, math.ceil(fraction * len(samples)) - 1)]
 
-    local_gpu_p50 = statistics.median(local_gpu_samples)
-    rank_gpu_p50 = sorted(all_rank_values(local_gpu_p50))
-    return {
-        "gpu_latency_ms_p50": statistics.median(critical_gpu_samples),
-        "gpu_latency_ms_p10": percentile(critical_gpu_samples, 0.10),
-        "gpu_latency_ms_p90": percentile(critical_gpu_samples, 0.90),
-        "local_gpu_latency_ms_p50": local_gpu_p50,
-        "rank_gpu_latency_ms_p50_min": rank_gpu_p50[0],
-        "rank_gpu_latency_ms_p50_median": statistics.median(rank_gpu_p50),
-        "rank_gpu_latency_ms_p50_max": rank_gpu_p50[-1],
+    invocation_local_p50 = statistics.median(invocation_local)
+    rank_invocation_p50 = sorted(all_rank_values(invocation_local_p50))
+    result = {
+        "invocation_gpu_latency_ms_p50": statistics.median(invocation_critical),
+        "invocation_gpu_latency_ms_p10": percentile(invocation_critical, 0.10),
+        "invocation_gpu_latency_ms_p90": percentile(invocation_critical, 0.90),
+        "local_invocation_gpu_latency_ms_p50": invocation_local_p50,
+        "rank_invocation_gpu_latency_ms_p50_min": rank_invocation_p50[0],
+        "rank_invocation_gpu_latency_ms_p50_median": statistics.median(
+            rank_invocation_p50
+        ),
+        "rank_invocation_gpu_latency_ms_p50_max": rank_invocation_p50[-1],
         "wall_latency_ms_p50": statistics.median(wall_samples),
         "wall_latency_ms_p10": percentile(wall_samples, 0.10),
         "wall_latency_ms_p90": percentile(wall_samples, 0.90),
@@ -586,8 +724,34 @@ def run_case(
         "shared_output_sum": shared_output_sum,
         "shared_output_l2_sq": shared_output_l2_sq,
         "cuda_graph": cuda_graph,
-        "samples": len(critical_gpu_samples),
+        "samples": len(invocation_critical),
     }
+    if kernel_critical is not None:
+        preparation_local_p50 = statistics.median(preparation_local)
+        kernel_local_p50 = statistics.median(kernel_local)
+        rank_preparation_p50 = sorted(all_rank_values(preparation_local_p50))
+        rank_kernel_p50 = sorted(all_rank_values(kernel_local_p50))
+        result.update(
+            preparation_gpu_latency_ms_p50=statistics.median(preparation_critical),
+            preparation_gpu_latency_ms_p10=percentile(preparation_critical, 0.10),
+            preparation_gpu_latency_ms_p90=percentile(preparation_critical, 0.90),
+            local_preparation_gpu_latency_ms_p50=preparation_local_p50,
+            rank_preparation_gpu_latency_ms_p50_min=rank_preparation_p50[0],
+            rank_preparation_gpu_latency_ms_p50_median=statistics.median(
+                rank_preparation_p50
+            ),
+            rank_preparation_gpu_latency_ms_p50_max=rank_preparation_p50[-1],
+            persistent_kernel_gpu_latency_ms_p50=statistics.median(kernel_critical),
+            persistent_kernel_gpu_latency_ms_p10=percentile(kernel_critical, 0.10),
+            persistent_kernel_gpu_latency_ms_p90=percentile(kernel_critical, 0.90),
+            local_persistent_kernel_gpu_latency_ms_p50=kernel_local_p50,
+            rank_persistent_kernel_gpu_latency_ms_p50_min=rank_kernel_p50[0],
+            rank_persistent_kernel_gpu_latency_ms_p50_median=statistics.median(
+                rank_kernel_p50
+            ),
+            rank_persistent_kernel_gpu_latency_ms_p50_max=rank_kernel_p50[-1],
+        )
+    return result
 
 
 def main() -> int:
@@ -626,7 +790,12 @@ def main() -> int:
 
     header = (
         "provider,global_tokens,padded_global_tokens,tokens_per_rank,"
-        "gpu_latency_ms_p10,gpu_latency_ms_p50,gpu_latency_ms_p90,"
+        "invocation_gpu_latency_ms_p10,invocation_gpu_latency_ms_p50,"
+        "invocation_gpu_latency_ms_p90,preparation_gpu_latency_ms_p10,"
+        "preparation_gpu_latency_ms_p50,preparation_gpu_latency_ms_p90,"
+        "persistent_kernel_gpu_latency_ms_p10,"
+        "persistent_kernel_gpu_latency_ms_p50,"
+        "persistent_kernel_gpu_latency_ms_p90,"
         "wall_latency_ms_p50,samples"
     )
     import flashinfer
@@ -663,11 +832,30 @@ def main() -> int:
             active_tokens_on_rank=active_tokens,
         )
         if rank == 0:
+            preparation_values = (
+                result.get("preparation_gpu_latency_ms_p10"),
+                result.get("preparation_gpu_latency_ms_p50"),
+                result.get("preparation_gpu_latency_ms_p90"),
+            )
+            preparation_csv = ",".join(
+                "" if value is None else f"{value:.6f}" for value in preparation_values
+            )
+            kernel_values = (
+                result.get("persistent_kernel_gpu_latency_ms_p10"),
+                result.get("persistent_kernel_gpu_latency_ms_p50"),
+                result.get("persistent_kernel_gpu_latency_ms_p90"),
+            )
+            kernel_csv = ",".join(
+                "" if value is None else f"{value:.6f}" for value in kernel_values
+            )
             print(
                 f"{args.provider},{global_tokens},{tokens_per_rank * world_size},"
-                f"{tokens_per_rank},{result['gpu_latency_ms_p10']:.6f},"
-                f"{result['gpu_latency_ms_p50']:.6f},"
-                f"{result['gpu_latency_ms_p90']:.6f},"
+                f"{tokens_per_rank},"
+                f"{result['invocation_gpu_latency_ms_p10']:.6f},"
+                f"{result['invocation_gpu_latency_ms_p50']:.6f},"
+                f"{result['invocation_gpu_latency_ms_p90']:.6f},"
+                f"{preparation_csv},"
+                f"{kernel_csv},"
                 f"{result['wall_latency_ms_p50']:.6f},{result['samples']}",
                 flush=True,
             )
