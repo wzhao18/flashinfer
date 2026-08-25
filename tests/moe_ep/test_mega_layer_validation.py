@@ -506,6 +506,56 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
     assert torch.equal(workspace.topk_weights[:num_tokens], topk_weights)
 
 
+def test_nvfp4_stage_inputs_binds_compatible_epilogue_tensors():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Nvfp4CutedslMegaKernelBackend,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    backend = Nvfp4CutedslMegaKernelBackend(
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        )
+    )
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        fc1_alpha=torch.zeros(2),
+        fc2_alpha=torch.zeros(2),
+        fc1_norm_const=torch.ones(2),
+        _shared_inputs=None,
+    )
+    fc1_alpha = torch.tensor([2.0, 3.0])
+    fc2_alpha = torch.tensor([4.0, 5.0], dtype=torch.bfloat16)
+    tensors = MoEEpTensors(
+        hidden_states=torch.zeros(1, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(1, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(1, 2),
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+    )
+
+    with mock.patch(
+        "flashinfer.moe_ep.backends.mega.kernel.sm100."
+        "nvfp4_nvfp4_bf16_cutedsl.backend.stage_mega_moe_inputs"
+    ):
+        backend.stage_inputs(tensors, workspace, quantize_input=True)
+
+    assert backend._active_epilogue is not None
+    active_fc1, active_fc2, active_norm = backend._active_epilogue
+    assert active_fc1 is fc1_alpha
+    assert active_fc2 is workspace.fc2_alpha
+    assert active_norm is workspace.fc1_norm_const
+    torch.testing.assert_close(active_fc2, fc2_alpha.float())
+
+
 def test_mega_layer_init_accepts_valid_transformed_weights():
     layer = _mega_layer()
     assert layer._transformed is not None
