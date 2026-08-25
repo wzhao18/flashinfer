@@ -45,7 +45,9 @@ class CaseTensors:
     fc1_norm_const: Any = None
     recv_count: Any = None
     num_tokens_per_expert: Any = None
-    mega_shared_inputs: Any = None
+    shared_hidden_states: Any = None
+    shared_expert_weights: Any = None
+    shared_expert_output: Any = None
 
     @property
     def num_tokens(self) -> int:
@@ -355,12 +357,11 @@ class TrtllmAgRsLayer:
         self._buffers.clear()
 
 
-def make_shared_state(max_tokens_per_rank: int):
+def make_shared_weights():
     import torch
 
     from flashinfer.moe_ep import (
         MoEWeightPack,
-        Nvfp4CutedslSharedExpertSession,
         preprocess_nvfp4_cutedsl_mega_weights,
     )
 
@@ -389,23 +390,14 @@ def make_shared_state(max_tokens_per_rank: int):
         )
         / 64
     )
-    weights = preprocess_nvfp4_cutedsl_mega_weights(
+    return preprocess_nvfp4_cutedsl_mega_weights(
         MoEWeightPack(w13=w13, w2=w2),
         intermediate_size=intermediate,
         hidden_size=hidden,
     )
-    session = Nvfp4CutedslSharedExpertSession(
-        max_num_tokens=max_tokens_per_rank,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        num_sms=28,
-        situ_beta=4.0,
-        situ_linear_beta=25.0,
-    )
-    return session, weights
 
 
-def make_case(rank: int, world_size: int, global_tokens: int, shared_state):
+def make_case(rank: int, world_size: int, global_tokens: int, shared_weights):
     import torch
 
     tokens_per_rank = math.ceil(global_tokens / world_size)
@@ -431,31 +423,26 @@ def make_case(rank: int, world_size: int, global_tokens: int, shared_state):
     if active_tokens < tokens_per_rank:
         topk_ids[active_tokens:].fill_(-1)
         topk_weights[active_tokens:].zero_()
-    shared_inputs = None
-    shared_stage = None
-    if shared_state is not None:
-        shared_session, shared_weights = shared_state
-        shared_hidden = torch.randn(
+    shared_hidden_states = None
+    shared_expert_output = None
+    if shared_weights is not None:
+        shared_hidden_states = torch.randn(
             tokens_per_rank,
             7168,
             dtype=torch.bfloat16,
             device="cuda",
             generator=generator,
         )
-        shared_session.stage(shared_hidden, integrated=True)
-        shared_inputs = shared_session.integrated_inputs(shared_weights)
-        shared_stage = shared_hidden
+        shared_expert_output = torch.empty_like(shared_hidden_states)
     tensors = CaseTensors(
         hidden_states=hidden,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-        mega_shared_inputs=shared_inputs,
+        shared_hidden_states=shared_hidden_states,
+        shared_expert_weights=shared_weights,
+        shared_expert_output=shared_expert_output,
     )
-    return tensors, shared_stage, active_tokens, tokens_per_rank
-
-
-def stage_shared(shared_session, hidden_states) -> None:
-    shared_session.stage(hidden_states, integrated=True)
+    return tensors, active_tokens, tokens_per_rank
 
 
 def max_rank_time_ms(local_ms: float) -> float:
@@ -470,8 +457,6 @@ def max_rank_time_ms(local_ms: float) -> float:
 def run_case(
     layer,
     tensors,
-    shared_stage,
-    shared_session,
     warmup: int,
     repeat: int,
     profile_cuda_range: bool,
@@ -480,8 +465,6 @@ def run_case(
     import torch.distributed as dist
 
     def invoke():
-        if shared_stage is not None:
-            stage_shared(shared_session, shared_stage)
         if getattr(layer, "supports_output_view", False):
             return layer.forward(tensors, return_workspace_view=True)
         return layer.forward(tensors)
@@ -514,6 +497,8 @@ def run_case(
         torch.cuda.cudart().cudaProfilerStop()
     assert output is not None
     assert torch.isfinite(output).all()
+    if tensors.shared_expert_output is not None:
+        assert torch.isfinite(tensors.shared_expert_output).all()
     gpu_samples.sort()
     wall_samples.sort()
 
@@ -548,11 +533,11 @@ def main() -> int:
         raise ValueError(f"expected EP{args.expected_world_size}, got EP{world_size}")
 
     max_tokens_per_rank = max(math.ceil(t / world_size) for t in args.global_tokens)
-    shared_state = None
+    shared_weights = None
     if args.provider.startswith("mega"):
         layer = make_mega_layer(rank, world_size, max_tokens_per_rank)
         if args.provider == "mega-fused":
-            shared_state = make_shared_state(max_tokens_per_rank)
+            shared_weights = make_shared_weights()
     else:
         layer = make_trtllm_layer(rank, world_size, max_tokens_per_rank)
 
@@ -574,14 +559,12 @@ def main() -> int:
         print(f"# metadata={json.dumps(metadata, sort_keys=True)}", flush=True)
         print(header, flush=True)
     for global_tokens in args.global_tokens:
-        tensors, shared_stage, active_tokens, tokens_per_rank = make_case(
-            rank, world_size, global_tokens, shared_state
+        tensors, active_tokens, tokens_per_rank = make_case(
+            rank, world_size, global_tokens, shared_weights
         )
         result = run_case(
             layer,
             tensors,
-            shared_stage,
-            shared_state[0] if shared_state is not None else None,
             args.warmup,
             args.repeat,
             args.profile_cuda_range,
@@ -608,8 +591,6 @@ def main() -> int:
                     output_file.write(json.dumps(result, sort_keys=True) + "\n")
 
     layer.destroy()
-    if shared_state is not None:
-        shared_state[0].destroy()
     dist.destroy_process_group()
     return 0
 

@@ -184,6 +184,23 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
         )
+        shared_values = (
+            t.shared_hidden_states,
+            t.shared_expert_weights,
+            t.shared_expert_output,
+        )
+        num_shared_values = sum(value is not None for value in shared_values)
+        if num_shared_values not in (0, len(shared_values)):
+            raise ValueError(
+                "shared_hidden_states, shared_expert_weights, and "
+                "shared_expert_output must be set together."
+            )
+        expects_shared = self._kernel_config.shared_hidden_size is not None
+        if bool(num_shared_values) != expects_shared:
+            requirement = "requires" if expects_shared else "does not support"
+            raise ValueError(
+                f"This kernel configuration {requirement} shared expert inputs."
+            )
 
     def stage_inputs(
         self,
@@ -241,16 +258,23 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.fc2_alpha.copy_(t.fc2_alpha)
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
-        workspace._mega_shared_inputs = t.mega_shared_inputs
+        if t.shared_hidden_states is not None:
+            assert t.shared_expert_weights is not None
+            assert t.shared_expert_output is not None
+            workspace._stage_shared(
+                t.shared_hidden_states,
+                t.shared_expert_weights,
+                t.shared_expert_output,
+            )
+        else:
+            workspace._shared_inputs = None
 
     def validate_capture_ready(
         self,
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> None:
-        frontend = workspace.frontend_for_shared_inputs(
-            workspace._mega_shared_inputs
-        )
+        frontend = workspace._frontend
         mega = frontend._mega
         if mega is None or mega.compiled is None:
             raise RuntimeError(
@@ -291,7 +315,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
-            shared=workspace._mega_shared_inputs,
+            shared=workspace._shared_inputs,
         )
 
     def _prepared_thunk_state(
@@ -301,9 +325,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         num_tokens: int | None = None,
     ) -> tuple:
         kcfg = self._kernel_config
-        fe = workspace.frontend_for_shared_inputs(
-            workspace._mega_shared_inputs
-        )
+        fe = workspace._frontend
         fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
@@ -316,7 +338,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             if num_tokens is None
             else min(((max(num_tokens, 1) + 63) // 64) * 64, workspace.x.shape[0])
         )
-        shared_inputs = workspace._mega_shared_inputs
+        shared_inputs = workspace._shared_inputs
         shared_identity = (
             tuple((t.data_ptr(), tuple(t.shape)) for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
             if shared_inputs is not None else ()
@@ -403,9 +425,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         state = self._prepared_thunk_state(workspace, transformed_weights, num_tokens)
         key, thunk, out_buf = state
         reducer_state = None
-        fe = workspace.frontend_for_shared_inputs(
-            workspace._mega_shared_inputs
-        )
+        fe = workspace._frontend
         if fe.config.defer_topk_reduce:
             partials, workspace_root, _region = (
                 fe.deferred_topk_reduce_workspace()
