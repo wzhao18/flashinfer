@@ -32,9 +32,9 @@ class MoEEpTensors:
     fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
-    # Opaque because the shared-expert ABI belongs to the optional NVFP4
-    # MegaMoE backend rather than the common tensor bundle.
-    mega_shared_inputs: Optional[Any] = None
+    shared_hidden_states: Optional["torch.Tensor"] = None
+    shared_expert_weights: Optional[Any] = None
+    shared_expert_output: Optional["torch.Tensor"] = None
 
     @property
     def num_tokens(self) -> int:

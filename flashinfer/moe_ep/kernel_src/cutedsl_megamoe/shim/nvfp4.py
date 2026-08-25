@@ -113,7 +113,6 @@ class MegaMoENvfp4Config:
     situ_linear_beta: Optional[float] = None
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
-    local_only: bool = False
     shared_hidden: Optional[int] = None
     shared_intermediate: Optional[int] = None
 
@@ -125,8 +124,6 @@ class MegaMoENvfp4Config:
                 f"rank must be in [0, world_size), got rank={self.rank}, "
                 f"world_size={self.world_size}."
             )
-        if self.local_only and self.world_size != 1:
-            raise ValueError("local_only requires world_size=1.")
         if (self.shared_hidden is None) != (self.shared_intermediate is None):
             raise ValueError(
                 "shared_hidden and shared_intermediate must be provided together."
@@ -243,7 +240,7 @@ class MegaMoENvfp4Config:
 
 
 @dataclasses.dataclass
-class MegaMoESharedNvfp4Inputs:
+class _SharedExpertInputs:
     """Rank-local shared-expert tensors fused into a MegaMoE launch."""
 
     activation: torch.Tensor
@@ -286,7 +283,7 @@ class MegaMoENvfp4Inputs:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     output_activation: torch.Tensor
-    shared: Optional[MegaMoESharedNvfp4Inputs] = None
+    shared: Optional[_SharedExpertInputs] = None
 
 
 class MegaMoENvfp4Frontend:
@@ -297,7 +294,6 @@ class MegaMoENvfp4Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
-        self._workspace_peer: Optional[MegaMoENvfp4Frontend] = None
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -547,7 +543,6 @@ class MegaMoENvfp4Frontend:
             c.situ_linear_beta,
             self._gate_up_clamp,
             c.enable_iket,
-            c.local_only,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -633,36 +628,16 @@ class MegaMoENvfp4Frontend:
             )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
-        peer_mega = (
-            self._workspace_peer._mega if self._workspace_peer is not None else None
+        local_workspace = torch.zeros(
+            (local_ws_bytes,),
+            dtype=torch.uint8,
+            device="cuda",
         )
-        can_share_workspaces = bool(
-            peer_mega is not None
-            and peer_mega.local_workspace.numel() >= local_ws_bytes
-            and peer_mega.shared_workspace.numel() >= shared_ws_bytes
-            and peer_mega.kernel._local_offsets == kernel._local_offsets
-            and peer_mega.kernel._shared_offsets == kernel._shared_offsets
+        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+        symmetric_base, peer_offsets_list = _compute_peer_offsets(
+            shared_workspace,
+            c.world_size,
         )
-        if can_share_workspaces:
-            assert peer_mega is not None
-            local_workspace = peer_mega.local_workspace
-            shared_workspace = peer_mega.shared_workspace
-            symmetric_base = peer_mega.symmetric_base
-            peer_offsets_list = peer_mega.peer_offsets_list
-        else:
-            local_workspace = torch.zeros(
-                (local_ws_bytes,),
-                dtype=torch.uint8,
-                device="cuda",
-            )
-            shared_workspace = sym_zeros(
-                (shared_ws_bytes,), torch.uint8, local_only=c.local_only
-            )
-            symmetric_base, peer_offsets_list = _compute_peer_offsets(
-                shared_workspace,
-                c.world_size,
-                local_only=c.local_only,
-            )
 
         mega = _CompiledMega(
             compiled=None,
@@ -671,7 +646,6 @@ class MegaMoENvfp4Frontend:
             shared_workspace=shared_workspace,
             symmetric_base=symmetric_base,
             peer_offsets_list=peer_offsets_list,
-            owns_workspaces=not can_share_workspaces,
         )
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
@@ -704,21 +678,9 @@ class MegaMoENvfp4Frontend:
         self._mega = None
 
     def _release_workspace(self) -> None:
-        mega = self._mega
-        if mega is None or not mega.owns_workspaces:
-            return
-        ensure_not_capturing("workspace release (symmetric-heap free)")
-        peer_mega = (
-            self._workspace_peer._mega if self._workspace_peer is not None else None
-        )
-        if (
-            peer_mega is not None
-            and peer_mega.shared_workspace.data_ptr()
-            == mega.shared_workspace.data_ptr()
-        ):
-            peer_mega.owns_workspaces = True
-        else:
-            free_sym_tensor(mega.shared_workspace)
+        if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
+            free_sym_tensor(self._mega.shared_workspace)
 
     @staticmethod
     def _resolve_num_tokens(
@@ -763,7 +725,7 @@ class MegaMoENvfp4Frontend:
 
         shared = inputs.shared
         if shared is not None:
-            shared = MegaMoESharedNvfp4Inputs(
+            shared = _SharedExpertInputs(
                 activation=shared.activation[tok],
                 activation_sf=shared.activation_sf,
                 fc1_weight=shared.fc1_weight,
@@ -1231,8 +1193,6 @@ def _resolve_per_expert_epilogue(
 def _sym_zeros_byte_view(
     logical_shape: Tuple[int, ...],
     target_dtype: torch.dtype,
-    *,
-    local_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """NVFP4 / fp8 symmetric heap via uint8 reinterpret (matches mega_runner).
 
@@ -1255,7 +1215,7 @@ def _sym_zeros_byte_view(
     total_bytes = 1
     for dim_size in storage_shape:
         total_bytes *= dim_size
-    root = sym_zeros((total_bytes,), torch.uint8, local_only=local_only)
+    root = sym_zeros((total_bytes,), torch.uint8)
     view = root.view(target_dtype).reshape(storage_shape)
     return view, root
 
@@ -1300,35 +1260,112 @@ class MegaMoESymmBuffer:
     fc1_norm_const: torch.Tensor
 
     _frontend: MegaMoENvfp4Frontend
-    _routed_frontend: Optional[MegaMoENvfp4Frontend] = None
-    _mega_shared_inputs: Optional[MegaMoESharedNvfp4Inputs] = None
+    _shared_x: Optional[torch.Tensor] = None
+    _shared_x_sf: Optional[torch.Tensor] = None
+    _shared_topk_idx: Optional[torch.Tensor] = None
+    _shared_topk_weights: Optional[torch.Tensor] = None
+    _shared_fc1_output: Optional[torch.Tensor] = None
+    _shared_fc1_output_sf: Optional[torch.Tensor] = None
+    _shared_fc1_done_counter: Optional[torch.Tensor] = None
+    _shared_fc1_alpha: Optional[torch.Tensor] = None
+    _shared_fc2_alpha: Optional[torch.Tensor] = None
+    _shared_fc1_norm_const: Optional[torch.Tensor] = None
+    _shared_inputs: Optional[_SharedExpertInputs] = None
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
 
-    def frontend_for_shared_inputs(
-        self, shared_inputs: Optional[MegaMoESharedNvfp4Inputs]
-    ) -> MegaMoENvfp4Frontend:
-        if shared_inputs is not None or self._frontend.config.shared_hidden is None:
-            return self._frontend
-        if self._routed_frontend is None:
-            ensure_not_capturing("routed-only MegaMoE frontend creation")
-            config = dataclasses.replace(
-                self._frontend.config,
-                shared_hidden=None,
-                shared_intermediate=None,
+    def _stage_shared(
+        self,
+        hidden_states: torch.Tensor,
+        transformed_weights: Tuple[TransformedWeights, TransformedWeights],
+        output: torch.Tensor,
+    ) -> None:
+        """Stage the optional rank-local shared expert into this workspace."""
+        config = self._frontend.config
+        shared_hidden = config.shared_hidden
+        shared_intermediate = config.shared_intermediate
+        if shared_hidden is None or shared_intermediate is None:
+            raise ValueError("This MegaMoE workspace has no shared expert.")
+        num_tokens = hidden_states.shape[0]
+        if hidden_states.shape != (num_tokens, shared_hidden):
+            raise ValueError(
+                "shared_hidden_states must have shape "
+                f"(num_tokens, {shared_hidden}), got {tuple(hidden_states.shape)}."
             )
-            self._routed_frontend = MegaMoENvfp4Frontend(config)
-            self._frontend._workspace_peer = self._routed_frontend
-            self._routed_frontend._workspace_peer = self._frontend
-        return self._routed_frontend
+        if num_tokens < 1 or num_tokens > self.num_max_tokens:
+            raise ValueError(
+                f"shared token count must be in [1, {self.num_max_tokens}], "
+                f"got {num_tokens}."
+            )
+        if output.shape != (num_tokens, shared_hidden):
+            raise ValueError(
+                "shared_expert_output must have shape "
+                f"({num_tokens}, {shared_hidden}), got {tuple(output.shape)}."
+            )
+
+        shared_tensors = (
+            self._shared_x,
+            self._shared_x_sf,
+            self._shared_topk_idx,
+            self._shared_topk_weights,
+            self._shared_fc1_output,
+            self._shared_fc1_output_sf,
+            self._shared_fc1_done_counter,
+            self._shared_fc1_alpha,
+            self._shared_fc2_alpha,
+            self._shared_fc1_norm_const,
+        )
+        assert all(tensor is not None for tensor in shared_tensors)
+        (
+            shared_x,
+            shared_x_sf,
+            shared_topk_idx,
+            shared_topk_weights,
+            shared_fc1_output,
+            shared_fc1_output_sf,
+            shared_fc1_done_counter,
+            shared_fc1_alpha,
+            shared_fc2_alpha,
+            shared_fc1_norm_const,
+        ) = shared_tensors
+
+        from .quant_stage import fused_quant_stage
+
+        fused_quant_stage(
+            hidden_states,
+            shared_topk_idx,
+            shared_topk_weights,
+            shared_x,
+            shared_x_sf,
+            shared_topk_idx,
+            shared_topk_weights,
+            quant_type="nvfp4",
+            norm_const=1.0,
+            sf_layout="blocked_128x4",
+        )
+        fc1, fc2 = transformed_weights
+        scale_rows = round_up(num_tokens, SfPaddingBlock)
+        self._shared_inputs = _SharedExpertInputs(
+            activation=shared_x[:num_tokens],
+            activation_sf=shared_x_sf[:scale_rows],
+            fc1_weight=fc1[0],
+            fc1_weight_sf=fc1[1],
+            fc1_output=shared_fc1_output[:num_tokens],
+            fc1_output_sf=shared_fc1_output_sf[:scale_rows],
+            fc2_weight=fc2[0],
+            fc2_weight_sf=fc2[1],
+            fc1_alpha=shared_fc1_alpha,
+            fc2_alpha=shared_fc2_alpha,
+            fc1_norm_const=shared_fc1_norm_const,
+            fc1_done_counter=shared_fc1_done_counter[:num_tokens],
+            output_activation=output,
+        )
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
             return
         self._frontend.release()
-        if self._routed_frontend is not None:
-            self._routed_frontend.release()
         for root in self._sym_roots:
             free_sym_tensor(root)
         self._sym_roots.clear()
@@ -1360,7 +1397,6 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
-    local_only: bool = False,
     shared_hidden: Optional[int] = None,
     shared_intermediate: Optional[int] = None,
 ) -> MegaMoESymmBuffer:
@@ -1462,7 +1498,6 @@ def get_symm_buffer_for_mega_moe(
         token_back_mode=(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
-        local_only=local_only,
         shared_hidden=shared_hidden,
         shared_intermediate=shared_intermediate,
     )
@@ -1479,25 +1514,20 @@ def get_symm_buffer_for_mega_moe(
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
 
     sym_roots: list[torch.Tensor] = []
-    x, x_root = _sym_zeros_byte_view(
-        (num_max_tokens, hidden), _DataDtype, local_only=local_only
-    )
+    x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
     sym_roots.append(x_root)
     x_sf, x_sf_root = _sym_zeros_byte_view(
         (num_max_tokens, hidden_sf_cols_padded),
         _ScaleDtype,
-        local_only=local_only,
     )
     sym_roots.append(x_sf_root)
-    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64, local_only=local_only)
+    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
     # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
     # tail, but start from the masked state so a partial first staging is safe.
     topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
-    topk_weights = sym_zeros(
-        (num_max_tokens, num_topk), torch.float32, local_only=local_only
-    )
+    topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
     # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
     # internally.  Allocated on the symmetric heap unconditionally: under
@@ -1507,9 +1537,7 @@ def get_symm_buffer_for_mega_moe(
     # the knob can flip per-compile (autotune / apply_knobs) without
     # reallocating; the cost ((T, hidden) bf16) is negligible next to the
     # internal combine staging.
-    output_activation = sym_zeros(
-        (num_max_tokens, hidden), torch.bfloat16, local_only=local_only
-    )
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
@@ -1526,6 +1554,59 @@ def get_symm_buffer_for_mega_moe(
         fc1_norm_const,
         num_experts_per_rank,
     )
+
+    shared_x = None
+    shared_x_sf = None
+    shared_topk_idx = None
+    shared_topk_weights = None
+    shared_fc1_output = None
+    shared_fc1_output_sf = None
+    shared_fc1_done_counter = None
+    shared_fc1_alpha = None
+    shared_fc2_alpha = None
+    shared_fc1_norm_const = None
+    if shared_hidden is not None:
+        assert shared_intermediate is not None
+        shared_down = shared_intermediate // 2
+        scale_rows = round_up(num_max_tokens, SfPaddingBlock)
+        shared_x = torch.empty(
+            num_max_tokens,
+            shared_hidden // 2,
+            dtype=_DataDtype,
+            device="cuda",
+        )
+        shared_x_sf = torch.zeros(
+            scale_rows,
+            round_up(ceil_div(shared_hidden, Nvfp4BlockSize), 4),
+            dtype=_ScaleDtype,
+            device="cuda",
+        )
+        shared_topk_idx = torch.zeros(
+            num_max_tokens, 1, dtype=torch.int64, device="cuda"
+        )
+        shared_topk_weights = torch.ones(
+            num_max_tokens, 1, dtype=torch.float32, device="cuda"
+        )
+        shared_fc1_output = torch.empty(
+            num_max_tokens,
+            shared_down // 2,
+            dtype=_DataDtype,
+            device="cuda",
+        )
+        shared_fc1_output_sf = torch.zeros(
+            scale_rows,
+            round_up(ceil_div(shared_down, Nvfp4BlockSize), 4),
+            dtype=_ScaleDtype,
+            device="cuda",
+        )
+        shared_fc1_done_counter = torch.zeros(
+            num_max_tokens, dtype=torch.int32, device="cuda"
+        )
+        shared_fc1_alpha = _resolve_per_expert_epilogue("shared_fc1_alpha", None, 1)
+        shared_fc2_alpha = _resolve_per_expert_epilogue("shared_fc2_alpha", None, 1)
+        shared_fc1_norm_const = _resolve_per_expert_epilogue(
+            "shared_fc1_norm_const", None, 1
+        )
 
     return MegaMoESymmBuffer(
         num_total_experts=num_total_experts,
@@ -1544,6 +1625,16 @@ def get_symm_buffer_for_mega_moe(
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
         _frontend=frontend,
+        _shared_x=shared_x,
+        _shared_x_sf=shared_x_sf,
+        _shared_topk_idx=shared_topk_idx,
+        _shared_topk_weights=shared_topk_weights,
+        _shared_fc1_output=shared_fc1_output,
+        _shared_fc1_output_sf=shared_fc1_output_sf,
+        _shared_fc1_done_counter=shared_fc1_done_counter,
+        _shared_fc1_alpha=shared_fc1_alpha,
+        _shared_fc2_alpha=shared_fc2_alpha,
+        _shared_fc1_norm_const=shared_fc1_norm_const,
         _sym_roots=sym_roots,
     )
 
@@ -1648,6 +1739,7 @@ def nvfp4_mega_moe(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        shared=symm_buffer._shared_inputs,
     )
 
     # The persistent kernel's cross-rank token addressing is capacity-specialized.
@@ -1696,6 +1788,7 @@ def nvfp4_mega_launch_thunk(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        shared=symm_buffer._shared_inputs,
     )
     return symm_buffer._frontend.make_launch_thunk(inputs)
 

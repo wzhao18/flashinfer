@@ -167,6 +167,23 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
         )
+        shared_values = (
+            t.shared_hidden_states,
+            t.shared_expert_weights,
+            t.shared_expert_output,
+        )
+        num_shared_values = sum(value is not None for value in shared_values)
+        if num_shared_values not in (0, len(shared_values)):
+            raise ValueError(
+                "shared_hidden_states, shared_expert_weights, and "
+                "shared_expert_output must be set together."
+            )
+        expects_shared = self._kernel_config.shared_hidden_size is not None
+        if bool(num_shared_values) != expects_shared:
+            requirement = "requires" if expects_shared else "does not support"
+            raise ValueError(
+                f"This kernel configuration {requirement} shared expert inputs."
+            )
 
     def stage_inputs(
         self,
@@ -224,7 +241,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.fc2_alpha.copy_(t.fc2_alpha)
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
-        workspace._mega_shared_inputs = t.mega_shared_inputs
+        if t.shared_hidden_states is not None:
+            assert t.shared_expert_weights is not None
+            assert t.shared_expert_output is not None
+            workspace._stage_shared(
+                t.shared_hidden_states,
+                t.shared_expert_weights,
+                t.shared_expert_output,
+            )
+        else:
+            workspace._shared_inputs = None
 
     def compute(
         self,
@@ -279,8 +305,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/clamp change nulls the frontend's compiled session,
         # changing the key and forcing a rebuild through the validated path.
-        shared_inputs = workspace._mega_shared_inputs
-        fe = workspace.frontend_for_shared_inputs(shared_inputs)
+        shared_inputs = workspace._shared_inputs
+        fe = workspace._frontend
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
