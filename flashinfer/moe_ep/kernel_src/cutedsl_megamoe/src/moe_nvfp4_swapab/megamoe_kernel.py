@@ -14,7 +14,7 @@ Shared / local workspace split:
   LOCAL   : expert_send_count, grid_sync_counter, l1_token_buffer,
             l1_sf_buffer, l1_topk_weights_buffer, l1_arrival_count,
             token_src_metadata, fc1_output, fc1_output_sf,
-            fc1_done_counter, (optionally) load_balance_counter
+            fc1_done_counter, (optionally) routed/shared task counters
 
 User tensors are not in the opaque workspaces. ``activation``,
 ``activation_sf``, ``topk_weights``, and ``combine_output`` must be reachable
@@ -612,7 +612,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 _RegionSpec(
                     "load_balance_counter",
                     cutlass.Int32,
-                    (1,),
+                    (3,),
                     16,
                 )
             )

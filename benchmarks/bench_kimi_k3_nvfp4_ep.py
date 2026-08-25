@@ -69,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument("--max-active-clusters", type=int, default=60)
     parser.add_argument("--expected-world-size", type=int, default=16)
     parser.add_argument("--output-jsonl")
     parser.add_argument(
@@ -79,11 +80,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def production_knobs() -> dict:
+def production_knobs(max_active_clusters: int) -> dict:
     return {
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 512,
-        "max_active_clusters": 60,
+        "max_active_clusters": max_active_clusters,
         "epi_flag_batch": (2, 4),
         "load_balance_mode": "atomic_counter",
         "mma_tiler_mnk": (256, 128, 256),
@@ -121,7 +122,12 @@ def make_weights(rank: int, local_experts: int, hidden: int, intermediate: int):
     return w13, w2
 
 
-def make_mega_layer(rank: int, world_size: int, max_tokens_per_rank: int):
+def make_mega_layer(
+    rank: int,
+    world_size: int,
+    max_tokens_per_rank: int,
+    max_active_clusters: int,
+):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -146,7 +152,7 @@ def make_mega_layer(rank: int, world_size: int, max_tokens_per_rank: int):
         combine_dtype="bf16",
         shared_hidden_size=7168,
         shared_intermediate_size=6144,
-        knobs=production_knobs(),
+        knobs=production_knobs(max_active_clusters),
     )
     return MoEEpLayer(
         BootstrapConfig(world_size=world_size, rank=rank),
@@ -454,6 +460,15 @@ def max_rank_time_ms(local_ms: float) -> float:
     return value.item()
 
 
+def sum_rank_value(local_value: float) -> float:
+    import torch
+    import torch.distributed as dist
+
+    value = torch.tensor(local_value, dtype=torch.float64, device="cuda")
+    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return value.item()
+
+
 def run_case(
     layer,
     tensors,
@@ -499,6 +514,15 @@ def run_case(
     assert torch.isfinite(output).all()
     if tensors.shared_expert_output is not None:
         assert torch.isfinite(tensors.shared_expert_output).all()
+    output_float = output.float()
+    output_sum = sum_rank_value(output_float.sum().item())
+    output_l2_sq = sum_rank_value(output_float.square().sum().item())
+    shared_output_sum = None
+    shared_output_l2_sq = None
+    if tensors.shared_expert_output is not None:
+        shared_float = tensors.shared_expert_output.float()
+        shared_output_sum = sum_rank_value(shared_float.sum().item())
+        shared_output_l2_sq = sum_rank_value(shared_float.square().sum().item())
     gpu_samples.sort()
     wall_samples.sort()
 
@@ -512,6 +536,10 @@ def run_case(
         "wall_latency_ms_p50": statistics.median(wall_samples),
         "wall_latency_ms_p10": percentile(wall_samples, 0.10),
         "wall_latency_ms_p90": percentile(wall_samples, 0.90),
+        "output_sum": output_sum,
+        "output_l2_sq": output_l2_sq,
+        "shared_output_sum": shared_output_sum,
+        "shared_output_l2_sq": shared_output_l2_sq,
         "samples": len(gpu_samples),
     }
 
@@ -535,7 +563,12 @@ def main() -> int:
     max_tokens_per_rank = max(math.ceil(t / world_size) for t in args.global_tokens)
     shared_weights = None
     if args.provider.startswith("mega"):
-        layer = make_mega_layer(rank, world_size, max_tokens_per_rank)
+        layer = make_mega_layer(
+            rank,
+            world_size,
+            max_tokens_per_rank,
+            args.max_active_clusters,
+        )
         if args.provider == "mega-fused":
             shared_weights = make_shared_weights()
     else:
@@ -554,6 +587,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "flashinfer_version": getattr(flashinfer, "__version__", "unknown"),
+        "max_active_clusters": args.max_active_clusters,
     }
     if rank == 0:
         print(f"# metadata={json.dumps(metadata, sort_keys=True)}", flush=True)

@@ -304,7 +304,8 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         if load_balance_mode == "atomic_counter" and load_balance_counter_ptr is None:
             raise ValueError(
                 "load_balance_counter_ptr must be provided when load_balance_mode == "
-                "'atomic_counter' (GMEM int32 ptr, host-allocated and zero-init per launch)"
+                "'atomic_counter' (GMEM int32 task counters, host-allocated and "
+                "zero-init per launch)"
             )
         if group_hint <= 0:
             raise ValueError(f"group_hint must be positive, got {group_hint}")
@@ -974,6 +975,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
     @cute.jit
     def _advance_work_linear_tile_idx_dynamic(
         self,
+        counter_offset: int = 0,
+        use_cached_first: bool = True,
         *,
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
@@ -1013,7 +1016,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
             lane_idx = tidx % Int32(32)
 
-            if cutlass.const_expr(self._first_advance_pending):
+            if cutlass.const_expr(
+                use_cached_first and self._first_advance_pending
+            ):
                 # First-tile path: consume the cached atomic_res that
                 # internal_init shuffled across the sched warp.
                 atomic_idx = ds.atomic_res
@@ -1022,7 +1027,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 atomic_idx = Int32(0)
                 if lane_idx == Int32(0):
                     atomic_idx = cute.arch.atomic_add(
-                        ds.counter_ptr,
+                        ds.counter_ptr + counter_offset,
                         Int32(1),
                         loc=loc,
                         ip=ip,
@@ -1064,6 +1069,46 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ds.consumer_state.advance()
 
         return cluster_idx
+
+    @dsl_user_op
+    @cute.jit
+    def gen_next_shared_work(
+        self,
+        phase: BlockPhase,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Claim and decode one shared-expert task dynamically."""
+        if cutlass.const_expr(
+            phase not in (BlockPhase.SharedLinear1, BlockPhase.SharedLinear2)
+        ):
+            raise ValueError(f"invalid shared-expert phase: {phase}")
+        counter_offset = 1
+        if phase == BlockPhase.SharedLinear2:
+            counter_offset = 2
+        cluster_linear_tile_idx = self._advance_work_linear_tile_idx_dynamic(
+            counter_offset=counter_offset,
+            use_cached_first=False,
+            loc=loc,
+            ip=ip,
+        )
+        phase_tile_count = (
+            self._num_shared_token_blocks * self._num_shared_fc1_blocks
+        )
+        phase_offset = Int32(0)
+        if cutlass.const_expr(phase == BlockPhase.SharedLinear2):
+            phase_offset = phase_tile_count
+            phase_tile_count = (
+                self._num_shared_token_blocks * self._num_shared_fc2_blocks
+            )
+        work_idx = phase_offset + cluster_linear_tile_idx
+        if cluster_linear_tile_idx >= phase_tile_count:
+            work_idx = (
+                self._num_shared_token_blocks
+                * (self._num_shared_fc1_blocks + self._num_shared_fc2_blocks)
+            )
+        self.gen_shared_work(work_idx, loc=loc, ip=ip)
 
     @dsl_user_op
     @cute.jit

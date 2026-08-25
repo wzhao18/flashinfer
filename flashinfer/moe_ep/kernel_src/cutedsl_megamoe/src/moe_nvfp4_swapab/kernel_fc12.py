@@ -617,9 +617,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         ) // mma_tiler_n + experts
         fc1_done_counter_bytes = counter_slots_upper * 4
 
-        # load_balance_counter: Int32 scalar.
+        # load_balance_counter: Int32 counters for routed work and, when
+        # present, shared FC1/FC2 work.
         if self.load_balance_mode == "atomic_counter":
-            load_balance_counter_bytes = 4
+            load_balance_counter_bytes = 12
         else:
             load_balance_counter_bytes = 0
 
@@ -2195,7 +2196,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
 
-            if cutlass.const_expr(shared_tma is not None):
+            if cutlass.const_expr(
+                shared_tma is not None
+                and self.load_balance_mode == "atomic_counter"
+            ):
+                scheduler.gen_next_shared_work(BlockPhase.SharedLinear1)
+                while scheduler.current_work.is_valid_tile:
+                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                    scheduler.publish_work()
+                    scheduler.gen_next_shared_work(BlockPhase.SharedLinear1)
+            elif cutlass.const_expr(shared_tma is not None):
                 shared_tile_idx = cutlass.Int32(bidz)
                 shared_fc1_tile_count = (
                     scheduler._num_shared_token_blocks
@@ -2237,7 +2247,17 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                 scheduler.publish_work()
                 scheduler.gen_next_work()
-            if cutlass.const_expr(shared_tma is not None):
+            if cutlass.const_expr(
+                shared_tma is not None
+                and self.load_balance_mode == "atomic_counter"
+            ):
+                if shared_fc2_enabled:
+                    scheduler.gen_next_shared_work(BlockPhase.SharedLinear2)
+                    while scheduler.current_work.is_valid_tile:
+                        ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                        scheduler.publish_work()
+                        scheduler.gen_next_shared_work(BlockPhase.SharedLinear2)
+            elif cutlass.const_expr(shared_tma is not None):
                 if shared_fc2_enabled:
                     shared_tile_idx = shared_fc1_tile_count + cutlass.Int32(bidz)
                     shared_tile_count = (
