@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import json
 import math
 import os
@@ -72,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-active-clusters", type=int, default=60)
     parser.add_argument("--expected-world-size", type=int, default=16)
     parser.add_argument("--output-jsonl")
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Time CUDA graph replays instead of eager layer invocations.",
+    )
     parser.add_argument(
         "--profile-cuda-range",
         action="store_true",
@@ -460,6 +467,18 @@ def max_rank_time_ms(local_ms: float) -> float:
     return value.item()
 
 
+def all_rank_values(local_value: float) -> list[float]:
+    import torch
+    import torch.distributed as dist
+
+    value = torch.tensor(local_value, dtype=torch.float64, device="cuda")
+    values = torch.empty(
+        dist.get_world_size(), dtype=torch.float64, device="cuda"
+    )
+    dist.all_gather_into_tensor(values, value)
+    return values.cpu().tolist()
+
+
 def sum_rank_value(local_value: float) -> float:
     import torch
     import torch.distributed as dist
@@ -475,6 +494,7 @@ def run_case(
     warmup: int,
     repeat: int,
     profile_cuda_range: bool,
+    cuda_graph: bool,
 ) -> dict:
     import torch
     import torch.distributed as dist
@@ -489,7 +509,23 @@ def run_case(
     torch.cuda.synchronize()
     dist.barrier()
 
-    gpu_samples = []
+    graph = None
+    graph_output = None
+    if cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = invoke()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    def measured_invoke():
+        if graph is None:
+            return invoke()
+        graph.replay()
+        return graph_output
+
+    local_gpu_samples = []
+    critical_gpu_samples = []
     wall_samples = []
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -501,10 +537,12 @@ def run_case(
         torch.cuda.synchronize()
         start.record()
         wall_started = time.perf_counter()
-        output = invoke()
+        output = measured_invoke()
         end.record()
         end.synchronize()
-        gpu_samples.append(max_rank_time_ms(start.elapsed_time(end)))
+        local_gpu_ms = start.elapsed_time(end)
+        local_gpu_samples.append(local_gpu_ms)
+        critical_gpu_samples.append(max_rank_time_ms(local_gpu_ms))
         wall_samples.append(
             max_rank_time_ms((time.perf_counter() - wall_started) * 1e3)
         )
@@ -523,16 +561,23 @@ def run_case(
         shared_float = tensors.shared_expert_output.float()
         shared_output_sum = sum_rank_value(shared_float.sum().item())
         shared_output_l2_sq = sum_rank_value(shared_float.square().sum().item())
-    gpu_samples.sort()
+    local_gpu_samples.sort()
+    critical_gpu_samples.sort()
     wall_samples.sort()
 
     def percentile(samples, fraction):
         return samples[max(0, math.ceil(fraction * len(samples)) - 1)]
 
+    local_gpu_p50 = statistics.median(local_gpu_samples)
+    rank_gpu_p50 = sorted(all_rank_values(local_gpu_p50))
     return {
-        "gpu_latency_ms_p50": statistics.median(gpu_samples),
-        "gpu_latency_ms_p10": percentile(gpu_samples, 0.10),
-        "gpu_latency_ms_p90": percentile(gpu_samples, 0.90),
+        "gpu_latency_ms_p50": statistics.median(critical_gpu_samples),
+        "gpu_latency_ms_p10": percentile(critical_gpu_samples, 0.10),
+        "gpu_latency_ms_p90": percentile(critical_gpu_samples, 0.90),
+        "local_gpu_latency_ms_p50": local_gpu_p50,
+        "rank_gpu_latency_ms_p50_min": rank_gpu_p50[0],
+        "rank_gpu_latency_ms_p50_median": statistics.median(rank_gpu_p50),
+        "rank_gpu_latency_ms_p50_max": rank_gpu_p50[-1],
         "wall_latency_ms_p50": statistics.median(wall_samples),
         "wall_latency_ms_p10": percentile(wall_samples, 0.10),
         "wall_latency_ms_p90": percentile(wall_samples, 0.90),
@@ -540,7 +585,8 @@ def run_case(
         "output_l2_sq": output_l2_sq,
         "shared_output_sum": shared_output_sum,
         "shared_output_l2_sq": shared_output_l2_sq,
-        "samples": len(gpu_samples),
+        "cuda_graph": cuda_graph,
+        "samples": len(critical_gpu_samples),
     }
 
 
@@ -554,7 +600,11 @@ def main() -> int:
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device("cuda", local_rank),
+        timeout=datetime.timedelta(minutes=30),
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size != args.expected_world_size:
@@ -602,6 +652,7 @@ def main() -> int:
             args.warmup,
             args.repeat,
             args.profile_cuda_range,
+            args.cuda_graph,
         )
         result.update(
             **metadata,
