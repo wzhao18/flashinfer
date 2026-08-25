@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Bracket measured iterations with cudaProfilerStart/Stop.",
     )
+    parser.add_argument(
+        "--skip-component-timing",
+        action="store_true",
+        help="Measure only the complete provider invocation.",
+    )
     return parser.parse_args()
 
 
@@ -608,6 +613,7 @@ def run_case(
     repeat: int,
     profile_cuda_range: bool,
     cuda_graph: bool,
+    skip_component_timing: bool,
 ) -> dict:
     import torch
     import torch.distributed as dist
@@ -629,7 +635,7 @@ def run_case(
     kernel_critical = None
     preparation_local = None
     preparation_critical = None
-    if layer.supports_output_view:
+    if layer.supports_output_view and not skip_component_timing:
         quantize_input = layer._resolve_quantize_input(tensors)
 
         def prepare_only():
@@ -822,6 +828,7 @@ def main() -> int:
             args.repeat,
             args.profile_cuda_range,
             args.cuda_graph,
+            args.skip_component_timing,
         )
         result.update(
             **metadata,
