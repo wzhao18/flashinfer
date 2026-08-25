@@ -1134,7 +1134,8 @@ class Fc12TesterBase:
           0:                                 fc1_output (packed)
           fc1_output_end:                    fc1_output_sf (atom-tiled)
           fc1_output_sf_end:                 fc1_done_counter (Int32 1D)
-          fc1_done_counter_end:              load_balance_counter (Int32 scalar,
+          fc1_done_counter_end:              load_balance_counter (Int32[1] or
+                                             Int32[3] with shared experts,
                                              atomic_counter mode only)
 
         Returns ``(fc1_output_torch, fc1_output_sf_torch,
@@ -1207,10 +1208,15 @@ class Fc12TesterBase:
         )
         offset += fc1_done_counter_byte_count
 
-        # -- load_balance_counter: Int32 scalar (atomic_counter mode only).
+        # -- load_balance_counter: routed, shared-FC1, and shared-FC2 task
+        # counters. Routed-only launches need just the first element.
         if self.impl.load_balance_mode == "atomic_counter":
-            load_balance_counter_torch = ws[offset : offset + 4].view(torch.int32)
-            offset += 4
+            counter_count = 3 if is_nvfp4 else 1
+            counter_bytes = counter_count * 4
+            load_balance_counter_torch = ws[
+                offset : offset + counter_bytes
+            ].view(torch.int32)
+            offset += counter_bytes
         else:
             load_balance_counter_torch = None
 
