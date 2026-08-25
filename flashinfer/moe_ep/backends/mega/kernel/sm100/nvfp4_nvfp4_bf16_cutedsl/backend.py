@@ -238,14 +238,25 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
+        def bind_epilogue(
+            source: torch.Tensor | None, target: torch.Tensor
+        ) -> torch.Tensor:
+            if source is None:
+                return target
+            if (
+                source.shape == target.shape
+                and source.dtype == target.dtype
+                and source.device == target.device
+                and source.is_contiguous()
+            ):
+                return source
+            target.copy_(source)
+            return target
+
         self._active_epilogue = (
-            t.fc1_alpha if t.fc1_alpha is not None else workspace.fc1_alpha,
-            t.fc2_alpha if t.fc2_alpha is not None else workspace.fc2_alpha,
-            (
-                t.fc1_norm_const
-                if t.fc1_norm_const is not None
-                else workspace.fc1_norm_const
-            ),
+            bind_epilogue(t.fc1_alpha, workspace.fc1_alpha),
+            bind_epilogue(t.fc2_alpha, workspace.fc2_alpha),
+            bind_epilogue(t.fc1_norm_const, workspace.fc1_norm_const),
         )
         if t.shared_hidden_states is not None:
             assert t.shared_expert_weights is not None
