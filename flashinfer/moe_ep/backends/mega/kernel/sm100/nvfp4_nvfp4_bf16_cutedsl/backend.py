@@ -206,6 +206,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 norm_const=self._kernel_config.input_norm_const,
+                token_padding_info=t.is_padding,
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).

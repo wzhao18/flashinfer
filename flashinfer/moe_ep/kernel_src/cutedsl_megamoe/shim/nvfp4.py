@@ -1344,6 +1344,7 @@ class MegaMoESymmBuffer:
             quant_type="nvfp4",
             norm_const=1.0,
             sf_layout="blocked_128x4",
+            mask_routing_tail=False,
         )
         fc1, fc2 = transformed_weights
         scale_rows = round_up(num_tokens, SfPaddingBlock)

@@ -194,6 +194,42 @@ def test_fused_nvfp4_stage_writes_blocked_scale_layout():
 
 
 @pytest.mark.arch_blackwell
+def test_fused_nvfp4_stage_masks_padding_during_routing_repack():
+    """Padding is masked by DataPreprocess without a separate torch.where."""
+    import torch
+
+    _require_blackwell()
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fused_quant_stage
+
+    num_tokens, hidden, topk, num_experts = 16, 2048, 4, 16
+    hidden_states, topk_ids, topk_weights = _make_batch(
+        num_tokens, hidden, topk, num_experts, seed=31
+    )
+    buffers = _make_buffers("nvfp4", num_tokens, hidden, topk)
+    is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+    is_padding[[3, 11]] = True
+
+    fused_quant_stage(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        *buffers,
+        quant_type="nvfp4",
+        norm_const=2.0,
+        token_padding_info=is_padding,
+    )
+    torch.cuda.synchronize()
+
+    expected_ids = topk_ids.to(torch.int64)
+    expected_ids[is_padding] = -1
+    expected_weights = topk_weights.clone()
+    expected_weights[is_padding] = 0.0
+    assert torch.equal(buffers[2], expected_ids)
+    assert torch.equal(buffers[3], expected_weights)
+
+
+@pytest.mark.arch_blackwell
 def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
     """Cache-hit relaunch (new data, same ptrs) and cache-rebuild (new n)."""
     import torch
