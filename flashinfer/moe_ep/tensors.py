@@ -35,6 +35,7 @@ class MoEEpTensors:
     shared_hidden_states: Optional["torch.Tensor"] = None
     shared_expert_weights: Optional[Any] = None
     shared_expert_output: Optional["torch.Tensor"] = None
+    is_padding: Optional["torch.Tensor"] = None
 
     @property
     def num_tokens(self) -> int:

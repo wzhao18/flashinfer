@@ -120,6 +120,8 @@ def fused_quant_stage(
     quant_type: str,
     norm_const: Optional[float] = None,
     sf_layout: Literal["row_major", "blocked_128x4"] = "row_major",
+    token_padding_info: Optional[torch.Tensor] = None,
+    mask_routing_tail: bool = True,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -131,6 +133,10 @@ def fused_quant_stage(
 
     ``norm_const`` is the NVFP4 offline per-tensor scale (required for
     ``quant_type="nvfp4"``, rejected otherwise).
+
+    ``token_padding_info`` lets the fused routing repack mask padded rows
+    without materializing adjusted top-k tensors. ``mask_routing_tail=False``
+    is for quantization-only users that discard the routing outputs.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
@@ -155,7 +161,8 @@ def fused_quant_stage(
         # previous batch left routed must be re-masked and the live-count memo
         # must record 0, or staged_tokens()/compute(output=None) would keep
         # reporting the previous batch.
-        _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+        if mask_routing_tail:
+            _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
         return
     sf_vec = 16 if is_nvfp4 else 32
     # hidden // sf_vec must be a multiple of 4 so the buffer's round-up-to-4
@@ -169,6 +176,13 @@ def fused_quant_stage(
         )
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+    if token_padding_info is not None and token_padding_info.shape != (num_tokens,):
+        raise ValueError(
+            "token_padding_info must have shape "
+            f"({num_tokens},), got {tuple(token_padding_info.shape)}."
+        )
+    if token_padding_info is not None and token_padding_info.dtype != torch.bool:
+        raise ValueError("token_padding_info must have dtype torch.bool.")
     topk = topk_ids.shape[1]
     n_blocks = hidden // sf_vec
     if x_sf_out.shape[1] != n_blocks:
@@ -183,7 +197,13 @@ def fused_quant_stage(
             "blocked_128x4 x_sf must provide a 128-row-padded physical plane"
         )
 
-    key = (topk, hidden, quant_type, sf_layout)
+    key = (
+        topk,
+        hidden,
+        quant_type,
+        sf_layout,
+        token_padding_info is not None,
+    )
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
@@ -210,6 +230,7 @@ def fused_quant_stage(
         x_sf_out.data_ptr(),
         topk_idx_out.data_ptr(),
         topk_weights_out.data_ptr(),
+        token_padding_info.data_ptr() if token_padding_info is not None else None,
         num_tokens,
         norm_const,
         sf_layout,
@@ -222,7 +243,7 @@ def fused_quant_stage(
             _to_cute(hidden_states, 16),
             _to_cute(topk_ids, 4),
             _to_cute(topk_weights, 4),
-            None,  # token_padding_info: only live rows are launched
+            _to_cute(token_padding_info, 1) if token_padding_info is not None else None,
             _to_cute(x_out[:num_tokens], 16),
             _to_cute(
                 x_sf_out if sf_layout == "blocked_128x4" else x_sf_out[:num_tokens],
@@ -244,7 +265,8 @@ def fused_quant_stage(
 
     stager.compiled(*stager.launch_args, **stager.launch_kwargs)
 
-    _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+    if mask_routing_tail:
+        _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
 
 
 def _mask_tail_and_note(

@@ -24,6 +24,7 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     norm_const: float = 1.0,
+    token_padding_info: torch.Tensor | None = None,
 ) -> None:
     """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
 
@@ -69,6 +70,7 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="nvfp4",
             norm_const=norm_const,
+            token_padding_info=token_padding_info,
         )
         return
 
@@ -88,6 +90,10 @@ def stage_mega_moe_inputs(
     x_sf[:num_tokens, :hidden_sf_cols].copy_(sf)
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
+    if token_padding_info is not None:
+        padding = token_padding_info[:num_tokens, None]
+        topk_idx_out[:num_tokens].masked_fill_(padding, -1)
+        topk_weights_out[:num_tokens].masked_fill_(padding, 0.0)
 
     capacity = x_nvfp4.shape[0]
     if num_tokens < capacity:
