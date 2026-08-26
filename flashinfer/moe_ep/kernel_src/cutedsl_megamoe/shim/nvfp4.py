@@ -95,7 +95,6 @@ class MegaMoENvfp4Config:
     use_2cta_instrs: bool = False
     load_balance_mode: Literal["static", "atomic_counter"] = "static"
     group_hint: Optional[int] = None
-    max_active_clusters: Optional[int] = None
     force_static_sched: bool = True
     clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = None
@@ -207,11 +206,6 @@ class MegaMoENvfp4Config:
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
                 f"group_hint must be positive when set, got {self.group_hint}."
-            )
-        if self.max_active_clusters is not None and self.max_active_clusters <= 0:
-            raise ValueError(
-                "max_active_clusters must be positive when set, got "
-                f"{self.max_active_clusters}."
             )
         if self.flag_batch < 1:
             raise ValueError(f"flag_batch must be >= 1, got {self.flag_batch}.")
@@ -546,7 +540,6 @@ class MegaMoENvfp4Frontend:
             c.use_2cta_instrs,
             c.load_balance_mode,
             c.group_hint,
-            c.max_active_clusters,
             c.force_static_sched,
             c.clc_bundle_size,
             c.num_sched_stages,
@@ -574,6 +567,7 @@ class MegaMoENvfp4Frontend:
 
         import cutlass
         import cutlass.cute as cute
+        import cutlass.utils as cutlass_utils
 
         from common.megamoe_constants import SfPaddingBlock
         from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
@@ -592,20 +586,9 @@ class MegaMoENvfp4Frontend:
         )
 
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
-        sm_count = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-        hardware_max_active_clusters = max(1, sm_count // max(cluster_size, 1))
-        max_active_clusters = (
-            c.max_active_clusters
-            if c.max_active_clusters is not None
-            else hardware_max_active_clusters
+        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
         )
-        if max_active_clusters > hardware_max_active_clusters:
-            raise ValueError(
-                "max_active_clusters cannot exceed hardware occupancy "
-                f"({max_active_clusters} > {hardware_max_active_clusters})."
-            )
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
         kernel = Sm100MegaMoEKernel(

@@ -71,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=30)
-    parser.add_argument("--max-active-clusters", type=int, default=60)
     parser.add_argument("--expected-world-size", type=int, default=16)
     parser.add_argument("--output-jsonl")
     parser.add_argument(
@@ -93,11 +92,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def production_knobs(max_active_clusters: int) -> dict:
+def production_knobs() -> dict:
     return {
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 512,
-        "max_active_clusters": max_active_clusters,
         "epi_flag_batch": (2, 4),
         "load_balance_mode": "atomic_counter",
         "mma_tiler_mnk": (256, 128, 256),
@@ -139,7 +137,6 @@ def make_mega_layer(
     rank: int,
     world_size: int,
     max_tokens_per_rank: int,
-    max_active_clusters: int,
 ):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -165,7 +162,7 @@ def make_mega_layer(
         combine_dtype="bf16",
         shared_hidden_size=7168,
         shared_intermediate_size=6144,
-        knobs=production_knobs(max_active_clusters),
+        knobs=production_knobs(),
     )
     return MoEEpLayer(
         BootstrapConfig(world_size=world_size, rank=rank),
@@ -787,7 +784,6 @@ def main() -> int:
             rank,
             world_size,
             max_tokens_per_rank,
-            args.max_active_clusters,
         )
         if args.provider == "mega-fused":
             shared_weights = make_shared_weights()
@@ -812,7 +808,6 @@ def main() -> int:
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "flashinfer_version": getattr(flashinfer, "__version__", "unknown"),
-        "max_active_clusters": args.max_active_clusters,
     }
     if rank == 0:
         print(f"# metadata={json.dumps(metadata, sort_keys=True)}", flush=True)

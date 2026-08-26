@@ -1597,8 +1597,6 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
     # quantized combine wires are only wired for dispatch-warp token-back.
     with pytest.raises(ValueError, match="reuse_dispatch_warps"):
         MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
-    with pytest.raises(ValueError, match="max_active_clusters"):
-        MegaMoENvfp4Config(**base, max_active_clusters=0)
 
 
 def test_tuner_is_valid_quantized_combine_rules():
