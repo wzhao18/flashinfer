@@ -748,6 +748,53 @@ def test_non_compact_state_stride(H: int, D: int):
     assert_close("non-compact state", c_vals, nc_vals, atol=0.1, rtol=0.05)
 
 
+def test_state_stride_exceeds_int32():
+    """Grouped decode accepts state strides beyond the signed 32-bit range."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    D = 128
+
+    state_init = torch.randn(1, 1, D, D, dtype=dtype, device=device) * 0.01
+    # A size-one outer dimension exercises the scalar stride ABI without a
+    # multi-gigabyte allocation.
+    state_large_stride = state_init.clone().as_strided(
+        size=(1, 1, D, D),
+        stride=(2**31, D * D, D, 1),
+    )
+    state_compact = state_init.clone()
+
+    q = torch.rand(1, 1, 1, D, dtype=dtype, device=device)
+    k = torch.rand_like(q)
+    v = torch.rand_like(q)
+    g = F.logsigmoid(torch.randn_like(q))
+    beta = torch.rand(1, 1, 1, dtype=dtype, device=device).sigmoid()
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    ssm_state_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "scale": D**-0.5,
+        "cu_seqlens": cu_seqlens,
+        "ssm_state_indices": ssm_state_indices,
+    }
+
+    out_compact, _ = recurrent_kda(initial_state=state_compact, **kwargs)
+    out_large_stride, _ = recurrent_kda(initial_state=state_large_stride, **kwargs)
+
+    assert_close("large-stride output", out_compact, out_large_stride)
+    assert_close(
+        "large-stride state",
+        state_compact.transpose(-1, -2).float(),
+        state_large_stride.transpose(-1, -2).float(),
+        atol=0.1,
+        rtol=0.05,
+    )
+
+
 # ==============================================================================
 # Non-contiguous gate stride tests
 # ==============================================================================
