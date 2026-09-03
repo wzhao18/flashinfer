@@ -50,6 +50,7 @@ from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 # None when the CuTe DSL is missing or cannot target this device
 # (see flashinfer/kda_kernels/__init__.py).
 _RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
+_RECURRENT_KDA_INT64_STATE_STRIDES = _RECURRENT_KDA_AVAILABLE
 
 
 @flashinfer_api(trace=recurrent_kda_trace)

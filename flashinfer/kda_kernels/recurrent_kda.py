@@ -872,8 +872,9 @@ def _grouped_kda_host(
     n_seq: cutlass.Int32,
     q_total: cutlass.Int32,
     g_stride_q: cutlass.Int32,
-    state_stride0: cutlass.Int32,
-    src_stride0: cutlass.Int32,
+    # Large paged state pools can exceed the 32-bit element address range.
+    state_stride0: cutlass.Int64,
+    src_stride0: cutlass.Int64,
     src_idx_stride: cutlass.Int32,
     scale: cutlass.Float32,
     lower_bound: cutlass.Float32,
