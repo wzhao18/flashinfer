@@ -48,6 +48,7 @@ def _run_trtllm_ragged(
     lse: torch.Tensor | None = None,
     q_lens_cpu: torch.Tensor | None = None,
     kv_lens_cpu: torch.Tensor | None = None,
+    assume_all_rows_active: bool = False,
 ):
     head_dim_qk = q.shape[2]
     return flashinfer.prefill.trtllm_ragged_attention_deepseek(
@@ -78,6 +79,7 @@ def _run_trtllm_ragged(
         lse=lse,
         q_seq_lens_cpu=q_lens_cpu,
         kv_seq_lens_cpu=kv_lens_cpu,
+        assume_all_rows_active=assume_all_rows_active,
     )
 
 
@@ -356,6 +358,72 @@ def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
 
     torch.testing.assert_close(fallback_output, mirror_output, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(fallback_lse, mirror_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_trusted_all_active_matches_cpu_mirror_path(monkeypatch):
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    q_lens = torch.tensor([4, 2, 3, 1], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor([7, 5, 3, 2], device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    q = torch.randn(
+        int(q_indptr[-1].item()), 16, 128, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        int(kv_indptr[-1].item()), 16, 128, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: True, raising=False
+    )
+
+    trusted_output, trusted_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        assume_all_rows_active=True,
+    )
+    mirror_output, mirror_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+    )
+
+    torch.testing.assert_close(trusted_output, mirror_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(trusted_lse, mirror_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_trusted_all_active_rejects_cpu_mirrors():
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            q_lens_cpu=q_lens.cpu(),
+            kv_lens_cpu=kv_lens.cpu(),
+            assume_all_rows_active=True,
+        )
 
 
 @pytest.mark.parametrize("use_cpu_lens", [True, False])
