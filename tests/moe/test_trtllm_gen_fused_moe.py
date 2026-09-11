@@ -57,6 +57,55 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
 pytestmark = pytest.mark.long_running
 
 
+@pytest.mark.parametrize("do_finalize", [False, True])
+def test_fp4_padding_mask_replay_preserves_real_tokens(do_finalize):
+    """Changing graph padding must not leave stale outputs or expert mappings."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM100-family GPU")
+    from flashinfer.trace.templates.moe import _moe_fp4_block_scale_init
+
+    tokens, top_k = 128, 8
+    inputs = _moe_fp4_block_scale_init(
+        seq_len=tokens,
+        num_experts=32,
+        num_local_experts=32,
+        hidden_size=256,
+        intermediate_size=256,
+        top_k=top_k,
+        routing_method_type=RoutingMethodType.DeepSeekV3,
+        n_group=1,
+        topk_group=1,
+    )
+    inputs.update(enable_pdl=True, do_finalize=do_finalize)
+
+    def finalize(outputs):
+        if do_finalize:
+            return outputs[0]
+        values, weights, indices = outputs
+        indices = indices.view(tokens, top_k)
+        selected = values[indices.clamp_min(0)].float()
+        selected.masked_fill_((indices < 0).unsqueeze(-1), 0)
+        return (selected * weights.view(tokens, top_k, 1)).sum(dim=1)
+
+    expected = finalize(trtllm_fp4_block_scale_moe(**inputs)).clone()
+    padding = torch.zeros(tokens, dtype=torch.bool, device="cuda")
+    trtllm_fp4_block_scale_moe(**inputs, is_padding=padding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = trtllm_fp4_block_scale_moe(**inputs, is_padding=padding)
+    for valid in (17, 0, tokens, 9, tokens):
+        padding[:] = torch.arange(tokens, device="cuda") >= valid
+        graph.replay()
+        actual = finalize(outputs)
+        torch.testing.assert_close(
+            actual[:valid], expected[:valid], atol=0.02, rtol=0.02
+        )
+        assert torch.isfinite(actual).all()
+        assert (actual[valid:] == 0).all()
+        if not do_finalize:
+            assert (outputs[2].view(tokens, top_k)[valid:] == -1).all()
+
+
 @pytest.fixture(scope="module")
 def cache_permute_indices():
     return {}

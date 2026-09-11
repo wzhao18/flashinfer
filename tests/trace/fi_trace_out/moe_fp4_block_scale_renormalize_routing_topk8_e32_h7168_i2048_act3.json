@@ -1,5 +1,5 @@
 {
-  "name": "moe_fp4_block_scale_renormalize_routing_topk2_e8_h1024_i512_act3",
+  "name": "moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048_act3",
   "description": "NvFP4 block-scale MoE with Renormalize routing (TopK \u2192 Softmax).",
   "op_type": "moe",
   "tags": [
@@ -14,52 +14,52 @@
     },
     "num_experts": {
       "type": "const",
-      "value": 8,
+      "value": 256,
       "description": "Total number of experts."
     },
     "top_k": {
       "type": "const",
-      "value": 2,
+      "value": 8,
       "description": "Number of experts selected per token."
     },
     "num_local_experts": {
       "type": "const",
-      "value": 8,
+      "value": 32,
       "description": "Number of local experts."
     },
     "hidden_size": {
       "type": "const",
-      "value": 1024,
+      "value": 7168,
       "description": "Hidden dimension size."
     },
     "intermediate_size": {
       "type": "const",
-      "value": 512,
+      "value": 2048,
       "description": "MoE intermediate layer size."
     },
     "gemm1_out_size": {
       "type": "const",
-      "value": 1024,
+      "value": 4096,
       "description": "Output size of FC1 (2 \u00d7 intermediate_size for SwiGLU)."
     },
     "num_packed_hidden": {
       "type": "const",
-      "value": 512,
+      "value": 3584,
       "description": "Packed hidden dimension (hidden_size // 2 for NvFP4)."
     },
     "num_fp4_hidden_blocks": {
       "type": "const",
-      "value": 64,
+      "value": 448,
       "description": "Number of FP4 scale blocks along hidden_size (hidden_size // 16 for NvFP4)."
     },
     "num_packed_intermediate": {
       "type": "const",
-      "value": 256,
+      "value": 1024,
       "description": "Packed intermediate dimension (intermediate_size // 2 for NvFP4)."
     },
     "num_fp4_intermediate_blocks": {
       "type": "const",
-      "value": 32,
+      "value": 128,
       "description": "Number of FP4 scale blocks along intermediate_size (intermediate_size // 16 for NvFP4)."
     },
     "activation_type": {
@@ -89,7 +89,7 @@
       "shape": [
         "num_experts"
       ],
-      "dtype": "bfloat16",
+      "dtype": "unknown",
       "optional": true,
       "description": "Bias added to routing logits. Pass None when not used."
     },
@@ -133,7 +133,7 @@
         "num_local_experts",
         "gemm1_out_size"
       ],
-      "dtype": "float32",
+      "dtype": "unknown",
       "optional": true,
       "description": "FC1 bias (float32). Optional."
     },
@@ -141,7 +141,7 @@
       "shape": [
         "num_local_experts"
       ],
-      "dtype": "float32",
+      "dtype": "unknown",
       "optional": true,
       "description": "Per-expert SiTU alpha or SwiGLU alpha (float32). Optional."
     },
@@ -149,7 +149,7 @@
       "shape": [
         "num_local_experts"
       ],
-      "dtype": "float32",
+      "dtype": "unknown",
       "optional": true,
       "description": "Per-expert SiTU beta or SwiGLU beta (float32). Optional."
     },
@@ -157,7 +157,7 @@
       "shape": [
         "num_local_experts"
       ],
-      "dtype": "float32",
+      "dtype": "unknown",
       "optional": true,
       "description": "Per-expert gated-activation clamp limit (float32). Optional."
     },
@@ -184,7 +184,7 @@
         "num_local_experts",
         "hidden_size"
       ],
-      "dtype": "float32",
+      "dtype": "unknown",
       "optional": true,
       "description": "FC2 bias (float32). Optional."
     },

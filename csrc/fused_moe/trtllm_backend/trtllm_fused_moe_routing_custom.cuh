@@ -60,6 +60,22 @@ void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t nu
 void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
                          void* stream);
 
+// Padded rows retain graph capacity but must never create expert tiles.
+template <typename KernelParams>
+__device__ __forceinline__ void clearPaddingRow(KernelParams const& params, int token, int lane) {
+  using OutputT = typename KernelParams::OutputT;
+  for (int k = lane; k < params.mTopK; k += WarpSize) {
+    int idx = token * params.mTopK + k;
+    if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr)
+      params.mPtrTopKWeights[idx] = OutputT{0};
+    if (params.mPtrTopKPacked != nullptr)
+      params.mPtrTopKPacked[idx] = PackedScoreIdx<OutputT>{OutputT{0}, int16_t{-1}};
+    if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
+      params.mPtrExpandedIdxToPermutedIdx[idx] = -1;
+    if (params.mPtrRoutingReplayOut != nullptr) params.mPtrRoutingReplayOut[idx] = -1;
+  }
+}
+
 #if defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -114,6 +130,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     cudaGridDependencySynchronize();
   }
 #endif
+
+  if (validToken && params.mPtrIsPadding != nullptr && params.mPtrIsPadding[warpIdx]) {
+    clearPaddingRow(params, warpIdx, laneIdx);
+    validToken = false;
+  }
 
   if (params.mPtrTopKIds != nullptr) {
     if (validToken) {
@@ -446,6 +467,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 
   // Phase 1: TopK — one warp per token (loop when numTokens > numWarps)
   for (int tokenIdx = warpIdx; tokenIdx < params.mNumTokens; tokenIdx += numWarps) {
+    if (params.mPtrIsPadding != nullptr && params.mPtrIsPadding[tokenIdx]) {
+      clearPaddingRow(params, tokenIdx, laneIdx);
+      continue;
+    }
     if (params.mPtrTopKIds != nullptr) {
       if (laneIdx < params.mTopK) {
         auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
@@ -745,6 +770,13 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
     cudaGridDependencySynchronize();
   }
 
+  if (validToken && params.mPtrIsPadding != nullptr && params.mPtrIsPadding[warpTokenIdx]) {
+    clearPaddingRow(params, warpTokenIdx, laneIdx);
+    if (laneIdx < params.mTopK)
+      smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx] = TypePacked{BaseType{0}, int16_t{-1}};
+    validToken = false;
+  }
+
   if (params.mPtrScores != nullptr) {
     BaseType warpTopKScore[KernelParams::MaxNumTopExperts];
     int32_t warpTopKExpertIdx[KernelParams::MaxNumTopExperts];
@@ -1033,6 +1065,10 @@ __global__ void __launch_bounds__(
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
   for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
+    if (params.mPtrIsPadding != nullptr && params.mPtrIsPadding[tokenIdx]) {
+      clearPaddingRow(params, tokenIdx, laneIdx);
+      continue;
+    }
     auto scoreOffset = tokenIdx * params.mNumExperts;
 
     BaseType laneTopKScore;
@@ -1237,6 +1273,14 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       for (int i = threadIdx.x; i < expertCountsNum; i += blockDim.x) {
         params.mPtrExpertCounts[i] = 0;
       }
+    }
+
+    if (params.mPtrIsPadding != nullptr && params.mPtrIsPadding[tokenIdx]) {
+      if (warpIdx == 0) clearPaddingRow(params, tokenIdx, laneIdx);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      if (params.mUsePdl) cudaTriggerProgrammaticLaunchCompletion();
+#endif
+      return;
     }
 
     // Phase 1: block-parallel preprocess.  Dispatches on PreProc so the kernel

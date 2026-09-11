@@ -573,6 +573,7 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                None,  # is_padding: tuning uses the full token capacity.
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

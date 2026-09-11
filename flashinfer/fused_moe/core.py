@@ -3377,6 +3377,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        is_padding: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3592,6 +3593,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 False,
                 valid_hidden_size,
                 valid_intermediate_size,
+                is_padding,
             )
             # FP4 always borrows the caller's topk_weights buffer (the launcher has
             # no allocate branch), so it is always the source for expert_weights.
@@ -3602,6 +3604,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 gemm1_lora_delta,
                 topk_weights,
             )
+
+        if is_padding is not None:
+            return run_selected_tactic(tactic)
 
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
@@ -3701,6 +3706,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        is_padding: Optional[torch.Tensor] = None,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
@@ -6190,11 +6196,16 @@ def trtllm_fp4_block_scale_moe(
     num_fused_shared_experts: Optional[int] = None,
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
+    is_padding: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
     Parameters
     ----------
+    is_padding : Optional[torch.Tensor]
+        Graph-stable bool tensor of shape ``[seq_len]``. True rows
+        do not route to experts. Currently requires non-grouped
+        custom routing and no fused shared experts.
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
@@ -6397,6 +6408,7 @@ def trtllm_fp4_block_scale_moe(
         routing_replay_out,
         valid_hidden_size,
         valid_intermediate_size,
+        is_padding,
     )
 
 

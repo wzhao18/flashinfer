@@ -1414,6 +1414,7 @@ def _fp4_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    is_padding=None,
     **_unused,
 ):
     """FP4 dequantize + gated activation + GEMM for all routing types.
@@ -1479,6 +1480,8 @@ def _fp4_moe_run_experts(
         if ge < 0 or ge >= E_global:
             continue
         sel_mask = (topk_idx == ge).any(dim=1)
+        if is_padding is not None:
+            sel_mask = sel_mask & ~is_padding
         if not sel_mask.any():
             continue
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
@@ -1885,6 +1888,12 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
+    "is_padding": Tensor(
+        ["seq_len"],
+        dtype="bool",
+        optional=True,
+        description="True rows do not route to experts.",
+    ),
     "routing_logits": Tensor(
         ["seq_len", "num_experts"],
         description="Routing logits for expert selection.",
@@ -4628,6 +4637,12 @@ trtllm_gen_routing_trace = TraceTemplate(
         "one": Var(description="Placeholder for shape [1] output tensors."),
     },
     inputs={
+        "is_padding": Tensor(
+            ["num_tokens"],
+            dtype="bool",
+            optional=True,
+            description="True rows have no expert assignments.",
+        ),
         "routing_logits": Tensor(
             ["num_tokens", "num_experts"], description="Router logits."
         ),

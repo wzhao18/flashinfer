@@ -1183,6 +1183,7 @@ class FusedMoeLauncher {
 
   // Optional routing replay output: [num_tokens, top_k] int16 tensor
   Optional<TensorView> routing_replay_out;
+  bool const* is_padding_ptr = nullptr;
 
   int64_t intermediate_size_factor{2};
 
@@ -1220,6 +1221,10 @@ class FusedMoeLauncher {
  public:
   void set_routing_replay_out(const Optional<TensorView>& replay_out) {
     routing_replay_out = replay_out;
+  }
+  void set_is_padding(const Optional<TensorView>& padding) {
+    is_padding_ptr =
+        padding.has_value() ? static_cast<bool const*>(padding.value().data_ptr()) : nullptr;
   }
 
  protected:
@@ -1652,7 +1657,7 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, is_padding_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -4428,7 +4433,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, is_padding_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5130,7 +5135,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
                        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
                        static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
+                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl, is_padding_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5784,7 +5789,14 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    Optional<TensorView> is_padding) {
+  if (is_padding.has_value()) {
+    CHECK_INPUT_AND_TYPE(is_padding.value(), dl_bool);
+    CHECK_DEVICE(is_padding.value(), hidden_states);
+    TVM_FFI_ICHECK_EQ(is_padding.value().ndim(), 1);
+    TVM_FFI_ICHECK_EQ(is_padding.value().numel(), hidden_states.size(0));
+  }
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -5919,6 +5931,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    /*weight_layout=*/0, static_cast<ActivationType>(act_type), mDtypeAct,
                    mDtypeWeights, static_cast<int64_t>(gemm1_bias_type_enum), norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
+    launcher->set_is_padding(is_padding);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }

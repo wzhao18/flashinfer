@@ -105,6 +105,7 @@ def _check_trtllm_gen_routing_supported(
     tile_tokens_dim: int = 8,
     norm_topk_prob: bool = True,
     enable_pdl: Optional[bool] = None,
+    is_padding: Optional[torch.Tensor] = None,
 ) -> bool:
     if routing_logits.dim() != 2:
         raise ValueError(
@@ -174,6 +175,7 @@ def get_trtllm_gen_routing_module():
         routing_method_type: int,
         norm_topk_prob: bool,
         enable_pdl: bool,
+        is_padding: Optional[torch.Tensor] = None,
     ) -> None:
         module.trtllm_gen_routing(
             routing_logits,
@@ -198,6 +200,7 @@ def get_trtllm_gen_routing_module():
             routing_method_type,
             norm_topk_prob,
             enable_pdl,
+            is_padding,
         )
 
     return SimpleNamespace(trtllm_gen_routing=trtllm_gen_routing)
@@ -220,6 +223,7 @@ def trtllm_gen_routing(
     tile_tokens_dim: int = 8,
     norm_topk_prob: bool = True,
     enable_pdl: Optional[bool] = None,
+    is_padding: Optional[torch.Tensor] = None,
 ) -> TrtllmGenRoutingResult:
     r"""Standalone trtllm-gen MoE routing (expert selection + permutation).
 
@@ -259,6 +263,10 @@ def trtllm_gen_routing(
     enable_pdl : Optional[bool]
         Whether to launch with programmatic dependent launch. Defaults to
         auto-detection.
+    is_padding : Optional[torch.Tensor]
+        Contiguous CUDA bool tensor of shape ``[num_tokens]``. True rows emit
+        zero weights and -1 mappings without creating expert tiles. Currently
+        supports non-grouped custom routing without fused shared experts.
 
     Returns
     -------
@@ -333,6 +341,7 @@ def trtllm_gen_routing(
         int(routing_method),
         norm_topk_prob,
         enable_pdl,
+        is_padding,
     )
 
     # Reconstruct expert ids from the permuted layout: slot p -> CTA tile

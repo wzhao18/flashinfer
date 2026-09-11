@@ -61,7 +61,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
+                 bool const* is_padding) {
+  FLASHINFER_CHECK(is_padding == nullptr || (numFusedSharedExpert == 0 && nGroup <= 1 &&
+                                             routingMethodType != RoutingMethodType::Llama4),
+                   "Padding mask currently requires non-grouped custom routing");
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // Only the grouped DeepSeek kernel below populates the fused shared-expert
     // slots; routingCustom leaves them untouched, so reject rather than return
@@ -76,6 +80,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;
     routingData.mUsePdl = enable_pdl;
+    routingData.mPtrIsPadding = is_padding;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
     routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
     routingData.mPtrRoutingBias = routingBias;
@@ -124,6 +129,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;
     routingData.mUsePdl = enable_pdl;
+    routingData.mPtrIsPadding = is_padding;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
     routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
     routingData.mPtrRoutingBias = routingBias;
@@ -165,6 +171,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mDtypeBias = dtypeBias;     // for DeepSeek, the bias can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
+    routingData.mPtrIsPadding = is_padding;
 
     int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
 
@@ -228,6 +235,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
+    routingData.mPtrIsPadding = is_padding;
 
     // output:
     routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -277,6 +285,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = enable_pdl;
+    routingData.mPtrIsPadding = is_padding;
 
     // Map routing method types to policy-based routing:
     // Note: RenormalizeNaive (Softmax → TopK → SumNormalize) is mathematically equivalent

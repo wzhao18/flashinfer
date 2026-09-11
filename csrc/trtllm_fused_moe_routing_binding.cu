@@ -63,7 +63,14 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
                         int64_t top_k, int64_t num_fused_shared_experts, int64_t n_group,
                         int64_t topk_group, int64_t local_expert_offset, int64_t local_num_experts,
                         double routed_scaling_factor, int64_t tile_tokens_dim,
-                        int64_t routing_method_type, bool norm_topk_prob, bool enable_pdl) {
+                        int64_t routing_method_type, bool norm_topk_prob, bool enable_pdl,
+                        Optional<TensorView> is_padding) {
+  if (is_padding.has_value()) {
+    CHECK_INPUT_AND_TYPE(is_padding.value(), dl_bool);
+    CHECK_DEVICE(is_padding.value(), routing_logits);
+    TVM_FFI_ICHECK_EQ(is_padding.value().ndim(), 1);
+    TVM_FFI_ICHECK_EQ(is_padding.value().numel(), routing_logits.size(0));
+  }
   CHECK_INPUT(routing_logits);
   CHECK_DIM(2, routing_logits);
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
@@ -185,7 +192,8 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
       /*dtypeElt=*/btg::Dtype::Bfloat16, dtype_bias,
       /*useRoutingScalesOnInput=*/false, /*useDeepSeekFp8=*/false,
       static_cast<RoutingMethodType>(routing_method_type), stream, dtype_logits, norm_topk_prob,
-      /*routing_replay_out=*/nullptr, enable_pdl);
+      /*routing_replay_out=*/nullptr, enable_pdl,
+      is_padding.has_value() ? static_cast<bool const*>(is_padding.value().data_ptr()) : nullptr);
 }
 
 }  // namespace flashinfer::trtllm_gen_routing

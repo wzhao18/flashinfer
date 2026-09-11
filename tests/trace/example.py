@@ -61,14 +61,14 @@ prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
-moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
-moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
+moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048_act3.json
+moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_act3_ng8_kg4.json
 moe_fp4_block_scale_ds_shared_experts_s1_e33_topk8_h256_i128_act3_ng8_kg4.json
-moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
-moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048_act3.json
+moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048_act3.json
 moe_fp4_block_scale_renormalize_routing_topk2_e8_h1024_i512_act3.json
-moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
-moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048_act3.json
+moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048_act3.json
 moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.json
 moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048.json
@@ -1210,6 +1210,7 @@ with contextlib.suppress(Exception):
         8,
         tile_tokens_dim=8,
         local_num_experts=E_tot,
+        is_padding=torch.arange(T_moe, device=device) >= T_moe // 2,
     )
 
 
@@ -1349,6 +1350,7 @@ if _fp4_moe_args is not None:
             n_group=None,
             topk_group=None,
             routing_method_type=1,
+            is_padding=torch.arange(T_fp4, device=device) >= T_fp4 // 2,
             **_fp4_moe_common,
         )
 

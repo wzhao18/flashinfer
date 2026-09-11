@@ -58,6 +58,65 @@ WEIGHT_ATOL = 1e-2
 WEIGHT_RTOL = 2e-2
 
 
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 32, 64, 128, 256, 2048, 8192])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "method",
+    [
+        RoutingMethodType.DeepSeekV3,
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+    ],
+)
+def test_padding_mask_changes_on_graph_replay(num_tokens, enable_pdl, method):
+    """Padding must not create expert tiles or retain stale permutation entries."""
+    logits = make_logits(num_tokens, 896, torch.float32, seed=17) / 16
+    bias = torch.linspace(-0.1, 0.1, 896, device="cuda")
+    padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+
+    def route(x, mask=None):
+        return trtllm_gen_routing(
+            x,
+            bias,
+            method,
+            16,
+            n_group=1,
+            topk_group=1,
+            tile_tokens_dim=8,
+            enable_pdl=enable_pdl,
+            is_padding=mask,
+        )
+
+    route(logits, padding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = route(logits, padding)
+
+    for pattern in ("full", "empty", "gaps", "prefix", "full"):
+        padding.fill_(pattern == "empty")
+        if pattern == "gaps":
+            padding[1::2] = True
+        elif pattern == "prefix":
+            padding[num_tokens // 2 + 1 :] = True
+        graph.replay()
+        valid = ~padding
+        assert (output.topk_ids[padding] == -1).all()
+        assert (output.topk_weights[padding] == 0).all()
+        assert (output.expanded_idx_to_permuted_idx[padding] == -1).all()
+        if valid.any():
+            reference = route(logits[valid])
+            torch.testing.assert_close(output.topk_ids[valid], reference.topk_ids)
+            torch.testing.assert_close(
+                output.topk_weights[valid], reference.topk_weights, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                output.num_non_exiting_ctas, reference.num_non_exiting_ctas
+            )
+        else:
+            assert output.num_non_exiting_ctas.item() == 0
+            assert output.total_num_padded_tokens.item() == 0
+
+
 @pytest.fixture(autouse=True)
 def require_supported_gpu():
     if not torch.cuda.is_available():

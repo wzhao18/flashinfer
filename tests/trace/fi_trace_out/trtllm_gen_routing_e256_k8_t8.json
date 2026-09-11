@@ -41,6 +41,14 @@
     "num_fused_shared_experts == 0"
   ],
   "inputs": {
+    "is_padding": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "bool",
+      "optional": true,
+      "description": "True rows have no expert assignments."
+    },
     "routing_logits": {
       "shape": [
         "num_tokens",

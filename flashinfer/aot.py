@@ -759,8 +759,6 @@ def gen_all_modules(
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
-            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
-            jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm100f:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
@@ -769,6 +767,8 @@ def gen_all_modules(
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
             jit_specs.append(gen_moe_utils_module())
         if has_sm100 or has_sm103:
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+            jit_specs.append(gen_trtllm_gen_routing_module())
             jit_specs.append(gen_mm_bf16_cublaslt_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
