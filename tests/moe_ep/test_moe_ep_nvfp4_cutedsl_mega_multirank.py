@@ -172,7 +172,7 @@ def _mega_problem(
 ):
     hidden = 2048
     intermediate = 1024
-    num_experts = 8
+    num_experts = max(8, world_size)
     topk = 4
     fast_math = True
     gate_up_clamp = None if activation == "situ" else 10.0
@@ -424,7 +424,8 @@ def _run_mega_layer(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     shared_expert: bool = False,
-    activation: str | None = None,
+    activation: str = "swiglu",
+    cuda_graph: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -467,6 +468,12 @@ def _run_mega_layer(
         config_extra.update(
             shared_hidden_size=shared_hidden,
             shared_intermediate_size=shared_intermediate,
+            knobs={
+                "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
+                "token_back_mode": "standalone_warps"
+                if in_kernel_fc2_reduce
+                else "epi_warps",
+            },
         )
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
@@ -633,6 +640,19 @@ def _run_mega_layer(
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
 
+        if cuda_graph:
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                y_layer2 = mega.forward(t)
+            for _ in range(3):
+                y_layer2.fill_(float("nan"))
+                if shared_output is not None:
+                    shared_output.fill_(float("nan"))
+                graph.replay()
+            torch.cuda.synchronize()
+
         if check_output_view:
             assert mega.supports_output_view
             y_view = mega.forward(t, return_workspace_view=True)
@@ -726,7 +746,11 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert():
+@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert(
+    cuda_graph, in_kernel_fc2_reduce
+):
     """Distributed shared-expert staging completes and matches its reference."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -738,6 +762,8 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_with_shared_expert():
         quantize_input=True,
         shared_expert=True,
         activation="situ",
+        cuda_graph=cuda_graph,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
     )
     print(f"rank {rank}: shared expert matches the distributed NVFP4 reference")
 

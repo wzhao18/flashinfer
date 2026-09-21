@@ -52,9 +52,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_states: dict[tuple, tuple] = {}
-        self._active_epilogue: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = (
-            None
-        )
+        self._active_epilogue: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -361,8 +361,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         shared_inputs = workspace._shared_inputs
         shared_identity = (
-            tuple((t.data_ptr(), tuple(t.shape)) for t in vars(shared_inputs).values() if isinstance(t, torch.Tensor))
-            if shared_inputs is not None else ()
+            tuple(
+                (t.data_ptr(), tuple(t.shape))
+                for t in vars(shared_inputs).values()
+                if isinstance(t, torch.Tensor)
+            )
+            if shared_inputs is not None
+            else ()
         )
         if self._active_epilogue is None:
             raise ValueError("compute() requires stage_inputs() to run first")
@@ -454,9 +459,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         reducer_state = None
         fe = workspace._frontend
         if fe.config.defer_topk_reduce:
-            partials, workspace_root, _region = (
-                fe.deferred_topk_reduce_workspace()
-            )
+            partials, workspace_root, _region = fe.deferred_topk_reduce_workspace()
             # Resolve/load the native module and borrowed view before the
             # upstream launch.  The terminal interval below must contain only
             # the two same-stream device launches—no lazy compilation,

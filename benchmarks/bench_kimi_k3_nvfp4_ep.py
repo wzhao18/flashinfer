@@ -50,6 +50,7 @@ class CaseTensors:
     shared_hidden_states: Any = None
     shared_expert_weights: Any = None
     shared_expert_output: Any = None
+    is_padding: Any = None
 
     @property
     def num_tokens(self) -> int:
@@ -101,6 +102,7 @@ def production_knobs() -> dict:
         "mma_tiler_mnk": (256, 128, 256),
         "flag_batch": 4,
         "token_back_mode": "standalone_warps",
+        "in_kernel_fc2_reduce": True,
     }
 
 
@@ -158,7 +160,7 @@ def make_mega_layer(
         activation="situ",
         situ_beta=4.0,
         situ_linear_beta=25.0,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
         combine_dtype="bf16",
         shared_hidden_size=7168,
         shared_intermediate_size=6144,

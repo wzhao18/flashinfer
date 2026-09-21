@@ -64,9 +64,7 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     def __post_init__(self) -> None:
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
-        if (self.shared_hidden_size is None) != (
-            self.shared_intermediate_size is None
-        ):
+        if (self.shared_hidden_size is None) != (self.shared_intermediate_size is None):
             raise ValueError(
                 "shared_hidden_size and shared_intermediate_size must be set together."
             )

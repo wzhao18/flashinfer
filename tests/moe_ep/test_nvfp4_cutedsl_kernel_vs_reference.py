@@ -352,18 +352,35 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 @pytest.mark.parametrize(
     "hidden,intermediate,num_experts,topk,activation_clamp,activation,situ_beta,situ_linear_beta",
     [
-        pytest.param(2048, 1024, 4, 4, "standard", "swiglu", None, None, id="regular-e4"),
+        pytest.param(
+            2048, 1024, 4, 4, "standard", "swiglu", None, None, id="regular-e4"
+        ),
         pytest.param(2880, 2880, 4, 4, "standard", "swiglu", None, None, id="tail-e4"),
-        pytest.param(2048, 1024, 1, 1, "standard", "swiglu", None, None, id="singleton-e1"),
+        pytest.param(
+            2048, 1024, 1, 1, "standard", "swiglu", None, None, id="singleton-e1"
+        ),
         pytest.param(2048, 1024, 4, 4, 0.5, "swiglu", None, None, id="minimax-clamp"),
-        pytest.param(2048, 1024, 4, 4, None, "swiglu", None, None, id="minimax-no-clamp"),
-        pytest.param(2048, 1024, 4, 4, "standard", "situ", 4.0, 25.0, id="kimi-situ-e4"),
-        pytest.param(3584, 3072, 56, 16, "standard", "situ", 4.0, 25.0, id="kimi-dep16-situ"),
+        pytest.param(
+            2048, 1024, 4, 4, None, "swiglu", None, None, id="minimax-no-clamp"
+        ),
+        pytest.param(
+            2048, 1024, 4, 4, "standard", "situ", 4.0, 25.0, id="kimi-situ-e4"
+        ),
+        pytest.param(
+            3584, 3072, 56, 16, "standard", "situ", 4.0, 25.0, id="kimi-dep16-situ"
+        ),
     ],
 )
 def test_nvfp4_kernel_matches_torch_reference(
-    monkeypatch, hidden, intermediate, num_experts, topk, activation_clamp,
-    activation, situ_beta, situ_linear_beta,
+    monkeypatch,
+    hidden,
+    intermediate,
+    num_experts,
+    topk,
+    activation_clamp,
+    activation,
+    situ_beta,
+    situ_linear_beta,
 ):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()

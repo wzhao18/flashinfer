@@ -528,9 +528,7 @@ def test_nvfp4_stage_inputs_binds_compatible_epilogue_tensors():
     )
 
     backend = Nvfp4CutedslMegaKernelBackend(
-        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128, top_k=2
-        )
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     workspace = SimpleNamespace(
         x=None,
