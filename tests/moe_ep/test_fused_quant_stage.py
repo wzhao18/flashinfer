@@ -152,8 +152,8 @@ def test_fused_nvfp4_stage_writes_blocked_scale_layout():
 
     _require_blackwell()
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fused_quant_stage
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_swapab.runner_common import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_nvfp4_swapab.runner_common import (
         to_blocked,
     )
 
@@ -200,7 +200,7 @@ def test_fused_nvfp4_stage_masks_padding_during_routing_repack():
 
     _require_blackwell()
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fused_quant_stage
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
 
     num_tokens, hidden, topk, num_experts = 16, 2048, 4, 16
     hidden_states, topk_ids, topk_weights = _make_batch(

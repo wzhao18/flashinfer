@@ -500,7 +500,7 @@ def sum_rank_value(local_value: float) -> float:
 
 def make_mega_kernel_thunks(layer, num_tokens: int):
     """Build separate reset and persistent-launch thunks for a warmed layer."""
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import MegaMoENvfp4Inputs
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import MegaMoENvfp4Inputs
 
     workspace = layer._workspace
     transformed = layer._transformed
