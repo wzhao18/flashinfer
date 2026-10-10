@@ -1436,15 +1436,21 @@ def test_cute_dsl_padded_gate_and_beta_match_compact_inputs(flash_kda_device):
 
 
 @_xfail_without_cute_dsl_experimental
-def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
+@pytest.mark.parametrize("num_sequences", [1, 16], ids=["decomp", "engine"])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("checkpoint_interval", [32, 64, 128])
+def test_cute_dsl_indexed_state_checkpoints_match_prefix_runs(
     flash_kda_device,
+    num_sequences,
+    state_dtype,
+    checkpoint_interval,
 ):
     inputs = _make_inputs(
-        seq_lens=[130],
+        seq_lens=[130] * num_sequences,
         num_heads=12,
         packed=True,
         initial_state=True,
-        state_dtype=torch.float32,
+        state_dtype=state_dtype,
         seed=4964,
     )
     initial_state = inputs["initial_state"].clone()
@@ -1454,53 +1460,70 @@ def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
         output_final_state=True,
         backend="cute-dsl",
     )
-    expected_checkpoints = [initial_state[0]]
-    for boundary in (64, 128):
+    expected_checkpoints = [initial_state]
+    for boundary in range(checkpoint_interval, 130, checkpoint_interval):
         prefix_inputs = {
             **inputs,
-            "q": inputs["q"][:, :boundary],
-            "k": inputs["k"][:, :boundary],
-            "v": inputs["v"][:, :boundary],
-            "g": inputs["g"][:, :boundary],
-            "beta": inputs["beta"][:, :boundary],
+            **{
+                name: torch.cat(
+                    [
+                        inputs[name][:, seq * 130 : seq * 130 + boundary]
+                        for seq in range(num_sequences)
+                    ],
+                    dim=1,
+                )
+                for name in ("q", "k", "v", "g", "beta")
+            },
             "initial_state": initial_state.clone(),
-            "cu_seqlens": torch.tensor(
-                [0, boundary], dtype=torch.int64, device=flash_kda_device
-            ),
+            "cu_seqlens": torch.arange(
+                num_sequences + 1, dtype=torch.int64, device=flash_kda_device
+            )
+            * boundary,
         }
         _, prefix_final_state = recurrent_kda(
             **_strict_prefill_kwargs(prefix_inputs),
             output_final_state=True,
             backend="cute-dsl",
         )
-        expected_checkpoints.append(prefix_final_state[0])
+        expected_checkpoints.append(prefix_final_state)
 
     state_pool = torch.zeros(
-        (3, 12, 128, 128), dtype=torch.float32, device=flash_kda_device
+        (num_sequences + 2, 13, 128, 128), dtype=state_dtype, device=flash_kda_device
+    )[:, :12]
+    # Pad the pool stride and reverse its rows to exercise indexed state loads.
+    state_indices = torch.arange(
+        num_sequences, 0, -1, dtype=torch.int32, device=flash_kda_device
     )
-    state_pool[1].copy_(initial_state[0])
-    state_indices = torch.tensor([1], dtype=torch.int32, device=flash_kda_device)
+    state_pool[state_indices.long()] = initial_state
+    checkpoints_per_sequence = len(expected_checkpoints)
     checkpoints = torch.empty(
-        (3, 12, 128, 128), dtype=torch.float32, device=flash_kda_device
+        (checkpoints_per_sequence * num_sequences, 12, 128, 128),
+        dtype=state_dtype,
+        device=flash_kda_device,
     )
-    checkpoint_starts = torch.tensor([0, 3], dtype=torch.int64, device=flash_kda_device)
+    checkpoint_starts = (
+        torch.arange(num_sequences + 1, dtype=torch.int64, device=flash_kda_device)
+        * checkpoints_per_sequence
+    )
     output, final_state, actual_checkpoints = recurrent_kda(
         **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
         output_final_state=True,
         ssm_state_indices=state_indices,
         state_checkpoints=checkpoints,
         checkpoint_cu_starts=checkpoint_starts,
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=checkpoint_interval,
         backend="cute-dsl",
     )
 
     assert final_state is state_pool
     assert actual_checkpoints is checkpoints
     torch.testing.assert_close(output, control_output, atol=0, rtol=0)
-    torch.testing.assert_close(state_pool[1], control_final_state[0], atol=0, rtol=0)
+    torch.testing.assert_close(
+        state_pool[state_indices.long()], control_final_state, atol=0, rtol=0
+    )
     torch.testing.assert_close(
         checkpoints,
-        torch.stack(expected_checkpoints),
+        torch.stack(expected_checkpoints, dim=1).reshape_as(checkpoints),
         atol=0,
         rtol=0,
     )

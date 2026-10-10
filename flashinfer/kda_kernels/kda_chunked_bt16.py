@@ -3277,19 +3277,24 @@ def tcgen05_store_initial_state_tmem(
                         state_slot, bidy, value_dim, key_dim
                     ].to(cutlass.Float32)
             state_block[col] = state_value
-            if cutlass.const_expr(state_ckpt is not None):
-                if (ckpt_slot >= cutlass.Int32(0)) & (
-                    ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
-                ):
+
+        # Finish the state loads before potentially aliasing snapshot stores
+        # serialize each load behind the preceding store.
+        if cutlass.const_expr(state_ckpt is not None):
+            if (ckpt_slot >= cutlass.Int32(0)) & (
+                ckpt_slot < cutlass.Int32(state_ckpt.shape[0])
+            ):
+                for col in cutlass.range_constexpr(TCGEN05_FINAL_STATE_TMEM_LOAD_COLS):
+                    key_dim = key_block_start + col
                     if cutlass.const_expr(HALF):
                         if valid_lane:
                             state_ckpt[ckpt_slot, bidy, value_dim, key_dim] = (
-                                state_value.to(state_ckpt.element_type)
+                                state_block[col].to(state_ckpt.element_type)
                             )
                     else:
-                        state_ckpt[ckpt_slot, bidy, value_dim, key_dim] = (
-                            state_value.to(state_ckpt.element_type)
-                        )
+                        state_ckpt[ckpt_slot, bidy, value_dim, key_dim] = state_block[
+                            col
+                        ].to(state_ckpt.element_type)
 
         projection_col_id = base_col_id + KDA_TMEM_STATE_COL_OFFSET + key_block_start
         block_addr = (row_id << 16) | projection_col_id
@@ -9333,6 +9338,9 @@ def kernel_chain_dv2(
             tmem_raw_addr = tmem_ptr_i32.load()
             if cutlass.const_expr(state_ckpt is not None):
                 cg0_ckpt_stride = checkpoint_stride_chunks
+                # Track checkpoint waits without dividing in the chunk loop.
+                cg0_ckpt_next = cg0_ckpt_stride
+                cg0_ckpt_phase = cutlass.Int32(0)
             if num_chunks > 0:
                 state_input_ready_wait(
                     state_input_ready_l_mbar,
@@ -9353,12 +9361,14 @@ def kernel_chain_dv2(
                     prev_kr_phase,
                 )
                 if cutlass.const_expr(state_ckpt is not None):
-                    if chunk % cg0_ckpt_stride == 0:
+                    if chunk == cg0_ckpt_next:
                         checkpoint_read_done_wait(
                             checkpoint_read_done_mbar,
-                            ((chunk // cg0_ckpt_stride) + cutlass.Int32(1)) % 2,
+                            cg0_ckpt_phase,
                         )
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                        cg0_ckpt_next += cg0_ckpt_stride
+                        cg0_ckpt_phase ^= cutlass.Int32(1)
                 state_left = tcgen05_stage_state_input_dv2_half_tmem(
                     tmem_raw_addr,
                     warp_idx,
