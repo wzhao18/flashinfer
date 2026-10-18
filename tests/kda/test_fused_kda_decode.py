@@ -828,8 +828,16 @@ def test_packed_fused_kda_decode_null_row(conv_layout):
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
 
 
-def test_packed_fused_kda_decode_ragged_rows_and_padding():
-    inputs = _make_packed_inputs(num_heads=12, num_sequences=3, num_tokens=4)
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_fused_kda_decode_ragged_rows_and_padding(conv_layout, state_dtype):
+    inputs = _make_packed_inputs(
+        num_heads=12,
+        num_sequences=3,
+        num_tokens=4,
+        state_dtype=state_dtype,
+        conv_layout=conv_layout,
+    )
     inputs["query_start_loc"].copy_(
         torch.tensor([0, 4, 6, 6], dtype=torch.int32, device=torch.device("cuda"))
     )
