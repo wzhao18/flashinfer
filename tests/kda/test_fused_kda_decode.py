@@ -264,7 +264,12 @@ def _packed_reference(inputs, conv_state, state):
 
 
 def _make_packed_inputs(
-    num_heads, num_sequences, num_tokens, seed=42, state_dtype=torch.float32
+    num_heads,
+    num_sequences,
+    num_tokens,
+    seed=42,
+    state_dtype=torch.float32,
+    conv_layout="SD",
 ):
     inputs = _make_inputs(
         num_heads,
@@ -284,6 +289,15 @@ def _make_packed_inputs(
     inputs["num_accepted_tokens"] = torch.ones(
         num_sequences, dtype=torch.int32, device=torch.device("cuda")
     )
+    if conv_layout == "DS":
+        conv = inputs["conv_state"]
+        dim_first = torch.empty_strided(
+            conv.shape,
+            (conv.stride(0), conv.shape[2], 1),
+            dtype=conv.dtype,
+            device=conv.device,
+        )
+        inputs["conv_state"] = dim_first.copy_(conv)
     return inputs
 
 
@@ -475,22 +489,33 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("num_heads", "num_sequences", "num_tokens"),
+    ("num_heads", "num_sequences", "num_tokens", "conv_layout"),
     [
-        pytest.param(12, 1, 1, id="h12-n1-t1"),
-        pytest.param(12, 2, 1, id="h12-n2-t1-dynamic-batch"),
-        pytest.param(12, 2, 2, id="h12-n2-t2"),
-        pytest.param(24, 4, 3, id="h24-n4-t3"),
-        pytest.param(32, 2, 4, id="h32-n2-t4"),
-        pytest.param(48, 2, 8, id="h48-n2-t8"),
-        pytest.param(96, 1, 3, id="h96-n1-t3"),
-        pytest.param(12, 32, 5, id="h12-n32-t5-wide"),
+        pytest.param(h, n, t, layout, id=f"h{h}-n{n}-t{t}-{layout}")
+        for h, n, t in (
+            (12, 1, 1),
+            (12, 2, 1),
+            (12, 2, 2),
+            (24, 4, 3),
+            (32, 2, 4),
+            (48, 2, 8),
+            (96, 1, 3),
+            (96, 4, 5),
+            (12, 32, 5),
+        )
+        for layout in (("SD",) if t == 1 else ("SD", "DS"))
     ],
 )
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_packed_fused_kda_decode(num_heads, num_sequences, num_tokens, state_dtype):
+def test_packed_fused_kda_decode(
+    num_heads, num_sequences, num_tokens, state_dtype, conv_layout
+):
     inputs = _make_packed_inputs(
-        num_heads, num_sequences, num_tokens, state_dtype=state_dtype
+        num_heads,
+        num_sequences,
+        num_tokens,
+        state_dtype=state_dtype,
+        conv_layout=conv_layout,
     )
     reference_conv = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
@@ -781,8 +806,11 @@ def test_packed_fused_kda_decode_split_tiles_load_frontend_in_one_pass():
         assert threads == 4 * 128
 
 
-def test_packed_fused_kda_decode_null_row():
-    inputs = _make_packed_inputs(num_heads=12, num_sequences=2, num_tokens=3)
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+def test_packed_fused_kda_decode_null_row(conv_layout):
+    inputs = _make_packed_inputs(
+        num_heads=12, num_sequences=2, num_tokens=3, conv_layout=conv_layout
+    )
     inputs["state_indices"][0].zero_()
     reference_conv = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
@@ -837,8 +865,13 @@ def test_packed_fused_kda_decode_ragged_rows_and_padding():
 
 @pytest.mark.parametrize("num_tokens", [3, 7, 8])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_packed_fused_kda_decode_two_verification_windows(num_tokens, state_dtype):
-    first = _make_packed_inputs(12, 2, num_tokens, seed=41, state_dtype=state_dtype)
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+def test_packed_fused_kda_decode_two_verification_windows(
+    num_tokens, state_dtype, conv_layout
+):
+    first = _make_packed_inputs(
+        12, 2, num_tokens, seed=41, state_dtype=state_dtype, conv_layout=conv_layout
+    )
     reference_conv = _clone_strided(first["conv_state"])
     reference_state = _clone_strided(first["state"])
     actual_conv = _clone_strided(first["conv_state"])
@@ -852,7 +885,9 @@ def test_packed_fused_kda_decode_two_verification_windows(num_tokens, state_dtyp
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
     torch.testing.assert_close(actual_first, expected_first, rtol=3e-2, atol=2e-2)
 
-    second = _make_packed_inputs(12, 2, num_tokens, seed=83, state_dtype=state_dtype)
+    second = _make_packed_inputs(
+        12, 2, num_tokens, seed=83, state_dtype=state_dtype, conv_layout=conv_layout
+    )
     second["state_indices"].copy_(first["state_indices"])
     second["num_accepted_tokens"].copy_(
         torch.tensor([2, num_tokens], dtype=torch.int32, device=torch.device("cuda"))
@@ -1147,8 +1182,16 @@ def test_packed_fused_kda_decode_t1_eager_valid_padding(
             assert torch.equal(inputs["conv_state"][slot], before_conv[slot])
 
 
-def test_packed_fused_kda_decode_cuda_graph_dynamic_metadata():
-    inputs = _make_packed_inputs(num_heads=12, num_sequences=3, num_tokens=4)
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_fused_kda_decode_cuda_graph_dynamic_metadata(conv_layout, state_dtype):
+    inputs = _make_packed_inputs(
+        num_heads=12,
+        num_sequences=3,
+        num_tokens=4,
+        conv_layout=conv_layout,
+        state_dtype=state_dtype,
+    )
     seeded_conv = _clone_strided(inputs["conv_state"])
     seeded_state = _clone_strided(inputs["state"])
     output = torch.full(
@@ -1381,8 +1424,8 @@ def test_packed_fused_kda_decode_cache_key(monkeypatch):
 
     monkeypatch.setattr(module, "build_and_load_cute_dsl_kernel", record_kernel_name)
     module._get_compiled_kernel.cache_clear()
-    base = [3, 12, -5.0, 1e-5, 2, 16, 1, 1, 1, False]
-    alternatives = [4, 24, -4.0, 2e-5, 1, 32, 2, 2, 4, True]
+    base = [3, 12, -5.0, 1e-5, 2, 16, 1, 1, 1, False, 1, False]
+    alternatives = [4, 24, -4.0, 2e-5, 1, 32, 2, 2, 4, True, 2, True]
     try:
         module._get_compiled_kernel(*base)
         for index, alternative in enumerate(alternatives):

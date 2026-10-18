@@ -641,6 +641,10 @@ def _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices):
         raise ValueError("T=1 remap metadata must be on the same device as x")
 
 
+# Capability metadata for callers selecting the T>1 verification backend.
+PACKED_FUSED_KDA_MULTITOKEN_CONV_STATE_LAYOUTS = ("SD", "DS")
+
+
 @flashinfer_api(trace=packed_fused_kda_decode_trace)
 def packed_fused_kda_decode(
     x: torch.Tensor,
@@ -709,7 +713,9 @@ def packed_fused_kda_decode(
             dtype float32.
         conv_state:
             Paged bfloat16 convolution cache. T=1 uses history length three;
-            T>1 uses the extended rolling history length ``T + 2``.
+            T>1 uses the extended rolling history length ``T + 2`` and accepts
+            either SD or DS storage through the logical
+            ``[num_slots, 3 * H * 128, T + 2]`` view. T=1 requires SD storage.
         raw_gate:
             Raw recurrence gate with shape ``[1, num_rows, H, 128]`` and dtype
             bfloat16.

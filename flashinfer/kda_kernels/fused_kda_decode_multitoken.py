@@ -801,6 +801,7 @@ def _get_compiled_kernel(
     SPLIT,
     state_is_bf16=False,
     norm_order=1,
+    conv_is_ds=False,
 ):
     dim = H * _D
     sequences = cute.sym_int()
@@ -818,7 +819,11 @@ def _get_compiled_kernel(
         cute.runtime.make_fake_tensor(
             cutlass.BFloat16,
             (slots, 3 * dim, T + _W - 2),
-            (cute.sym_int64(divisibility=16), 1, 3 * dim),
+            (
+                cute.sym_int64(divisibility=16),
+                T + _W - 2 if conv_is_ds else 1,
+                1 if conv_is_ds else 3 * dim,
+            ),
             assumed_align=16,
         ),
         _compact_fake((1, rows, H, _D), cutlass.BFloat16),
@@ -855,6 +860,7 @@ def _get_compiled_kernel(
         f"_r{R}_kq{KQ}_bpm{bpm}_nch{NCH}_split{SPLIT}"
         f"{'_sbf16' if state_is_bf16 else ''}"
         f"{'_normorder' + str(norm_order) if norm_order > 1 else ''}"
+        f"{'_conv_ds' if conv_is_ds else ''}"
     )
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
@@ -933,6 +939,7 @@ def _run_fused_kda_decode_multitoken(
         SPLIT,
         state.dtype == torch.bfloat16,
         norm_order,
+        conv_state.stride(2) == 1,
     )
 
     entry(
@@ -1028,10 +1035,10 @@ def run_fused_kda_decode_multitoken(
     if (
         conv_state.ndim != 3
         or conv_state.shape[1:] != (3 * hidden_size, num_tokens + _W - 2)
-        or conv_state.stride(1) != 1
-        or conv_state.stride(2) != 3 * hidden_size
+        or (conv_state.stride(1), conv_state.stride(2))
+        not in ((1, 3 * hidden_size), (num_tokens + _W - 2, 1))
     ):
-        raise ValueError("conv_state must use the extended paged SD cache layout")
+        raise ValueError("conv_state must use the extended paged SD or DS cache layout")
     num_rows = x.shape[0]
     if raw_gate.shape != (1, num_rows, num_heads, _D):
         raise ValueError("raw_gate must have shape [1, num_rows, H, 128]")

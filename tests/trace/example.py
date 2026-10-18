@@ -1347,7 +1347,7 @@ if torch.cuda.get_device_capability(device)[0] == 10:
     fkp_conv_storage = torch.zeros(
         fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
     )
-    fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+    fkp_conv_state = fkp_conv_storage.transpose(1, 2).contiguous()
     fkp_raw_gate = torch.randn(
         1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
     )
