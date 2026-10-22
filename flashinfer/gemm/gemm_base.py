@@ -28,7 +28,7 @@ import torch
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
-from ..api_logging import flashinfer_api
+from ..api_logging import api_call_hooks_enabled, flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
@@ -6513,6 +6513,45 @@ def _check_cute_dsl_availability():
         raise ValueError("CuTe DSL is not available.")
 
 
+def _block_scaled_mxfp8_launcher(compiled_gemm, swap_ab, sf_m, sf_n, sf_k, alpha):
+    """``launch(a, b, a_descale, b_descale, out)`` of a compiled CuTe-DSL
+    block-scaled MXFP8 GEMM, for the shapes ``sf_m``/``sf_n``/``sf_k`` were
+    derived from."""
+    if swap_ab:
+        # Swap A/B: the kernel expects both mA and mB with shape (*, K).
+        # b is (k, n) col-major -> b.T is (n, k) row-major; a is already
+        # (m, k) row-major. The kernel writes C^T, i.e. out viewed M-major.
+        def launch(a, b, a_descale, b_descale, out):
+            compiled_gemm(
+                b.T,
+                a,
+                out.as_strided(out.shape, (1, out.shape[0])),
+                sf_m,
+                sf_n,
+                sf_k,
+                b_descale.data_ptr(),
+                a_descale.data_ptr(),
+                alpha,
+            )
+
+    else:
+
+        def launch(a, b, a_descale, b_descale, out):
+            compiled_gemm(
+                a,
+                b.T,
+                out,
+                sf_m,
+                sf_n,
+                sf_k,
+                a_descale.data_ptr(),
+                b_descale.data_ptr(),
+                alpha,
+            )
+
+    return launch
+
+
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
@@ -6613,6 +6652,16 @@ def _cute_dsl_gemm_mxfp8_runner(
             **kwargs,
         ):
             (a, b, a_descale, b_descale, _, out, _) = inputs
+            self.make_launcher(inputs, tactic)(a, b, a_descale, b_descale, out)
+            return out
+
+        def make_launcher(self, inputs: List[torch.Tensor], tactic=None):
+            """Resolve ``tactic`` and compile its kernel for ``inputs``.
+
+            Returns ``launch(a, b, a_descale, b_descale, out)``, which runs the
+            GEMM on tensors with the shapes, strides and dtypes of ``inputs``.
+            """
+            (a, b, a_descale, b_descale, _, out, _) = inputs
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
@@ -6707,15 +6756,8 @@ def _cute_dsl_gemm_mxfp8_runner(
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                # Swap A/B: kernel expects both mA and mB with shape (*, K).
-                # b is (k, n) col-major → b.T is (n, k) row-major.
-                # a is already (m, k) row-major — no transpose needed.
-                kernel_a, kernel_b = b.T, a
-                kernel_a_sf, kernel_b_sf = b_descale, a_descale
             else:
                 kernel_m, kernel_n = m, n
-                kernel_a, kernel_b = a, b.T
-                kernel_a_sf, kernel_b_sf = a_descale, b_descale
 
             sf_m = (kernel_m + 127) // 128
             sf_n = (kernel_n + 127) // 128
@@ -6768,23 +6810,9 @@ def _cute_dsl_gemm_mxfp8_runner(
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
-
-            launch_out = (
-                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            return _block_scaled_mxfp8_launcher(
+                compiled_gemm, swap_ab, sf_m, sf_n, sf_k, alpha_for_launch
             )
-
-            compiled_gemm(
-                kernel_a,
-                kernel_b,
-                launch_out,
-                sf_m,
-                sf_n,
-                sf_k,
-                kernel_a_sf.data_ptr(),
-                kernel_b_sf.data_ptr(),
-                alpha_for_launch,
-            )
-            return out
 
     return CuteDSLMxfp8GemmRunner()
 
@@ -6865,6 +6893,12 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
             **kwargs,
         ):
             (a, b, a_descale, b_descale, _, out, _) = inputs
+            self.make_launcher(inputs, tactic)(a, b, a_descale, b_descale, out)
+            return out
+
+        def make_launcher(self, inputs: List[torch.Tensor], tactic=None):
+            """See ``CuteDSLMxfp8GemmRunner.make_launcher``."""
+            (a, b, _, _, _, _, _) = inputs
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
@@ -6883,12 +6917,8 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
             sf_vec_size = 32
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                kernel_a, kernel_b = b.T, a
-                kernel_a_sf, kernel_b_sf = b_descale, a_descale
             else:
                 kernel_m, kernel_n = m, n
-                kernel_a, kernel_b = a, b.T
-                kernel_a_sf, kernel_b_sf = a_descale, b_descale
 
             sf_m = (kernel_m + 127) // 128
             sf_n = (kernel_n + 127) // 128
@@ -6915,21 +6945,14 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                 batch_size=1,
             )
 
-            launch_out = (
-                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
-            )
-            compiled_gemm(
-                kernel_a,
-                kernel_b,
-                launch_out,
+            return _block_scaled_mxfp8_launcher(
+                compiled_gemm,
+                swap_ab,
                 sf_m,
                 sf_n,
                 sf_k,
-                kernel_a_sf.data_ptr(),
-                kernel_b_sf.data_ptr(),
                 _prepare_alpha_for_launch(None, a.device),
             )
-            return out
 
     return CuteDSLMxfp8Sm107GemmRunner()
 
@@ -7002,20 +7025,41 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
         ) -> torch.Tensor:
             a, b, a_descale, b_descale, _, out, _ = inputs
             with torch.cuda.device(a.device):
-                if tactic == -1:
-                    tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
-                else:
-                    try:
-                        tactic = MxFp8WarpSplitKTactic(*tactic)
-                    except TypeError as error:
-                        raise ValueError(
-                            "CuTeDSL MXFP8 warp split-K tactics must be "
-                            "(output_tile, token_tile, k_tile, stages, "
-                            "b_loader_warps)."
-                        ) from error
                 return run_mxfp8_warp_splitk(
-                    a, b, a_descale, b_descale, out, enable_pdl, tactic
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    out,
+                    enable_pdl,
+                    self._resolve_tactic(a, b, tactic),
                 )
+
+        def _resolve_tactic(self, a, b, tactic):
+            if tactic == -1:
+                return default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            try:
+                return MxFp8WarpSplitKTactic(*tactic)
+            except TypeError as error:
+                raise ValueError(
+                    "CuTeDSL MXFP8 warp split-K tactics must be "
+                    "(output_tile, token_tile, k_tile, stages, "
+                    "b_loader_warps)."
+                ) from error
+
+        def make_launcher(self, inputs: List[torch.Tensor], tactic=-1):
+            """See ``CuteDSLMxfp8GemmRunner.make_launcher``."""
+            a, b, *_ = inputs
+            with torch.cuda.device(a.device):
+                resolved = self._resolve_tactic(a, b, tactic)
+
+            def launch(a, b, a_descale, b_descale, out):
+                with torch.cuda.device(a.device):
+                    run_mxfp8_warp_splitk(
+                        a, b, a_descale, b_descale, out, enable_pdl, resolved
+                    )
+
+            return launch
 
     return CuteDSLMxfp8WarpSplitKRunner()
 
@@ -7215,6 +7259,89 @@ def _heuristic_func_mm_mxfp8(
     return []
 
 
+# Launches of mm_mxfp8(backend="cute-dsl") calls that went through the full
+# path (checks, runner selection, tactic resolution, kernel compilation),
+# keyed by _mm_mxfp8_launch_key. A later call with the same key skips straight
+# to the launch. Entries belong to one AutoTuner selection epoch: the cache is
+# dropped whenever the tuner state they were selected from changes, and
+# nothing is cached while tuning.
+_MM_MXFP8_LAUNCH_CACHE: dict = {}
+_MM_MXFP8_LAUNCH_CACHE_EPOCH: List[Optional[int]] = [None]
+_MM_MXFP8_LAUNCH_CACHE_CAPACITY = 1024
+
+
+def _mm_mxfp8_launch_key(
+    a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+) -> tuple:
+    """Everything the checks, the runner selection and the launch of a
+    cute-dsl mm_mxfp8 call depend on, other than tensor contents."""
+    return (
+        # The compiled-kernel cache is keyed by the current device.
+        torch.cuda.current_device(),
+        a.get_device(),
+        a.shape,
+        a.stride(),
+        a.dtype,
+        b.get_device(),
+        b.shape,
+        b.stride(),
+        b.dtype,
+        a_descale.get_device(),
+        a_descale.shape,
+        a_descale.stride(),
+        a_descale.dtype,
+        b_descale.get_device(),
+        b_descale.shape,
+        b_descale.stride(),
+        b_descale.dtype,
+        None if out is None else (out.shape, out.stride(), out.dtype, out.get_device()),
+        out_dtype,
+        use_8x4_sf_layout,
+    )
+
+
+def _remember_mm_mxfp8_launch(epoch: int, key: tuple, launch: Callable) -> None:
+    cache = _MM_MXFP8_LAUNCH_CACHE
+    if _MM_MXFP8_LAUNCH_CACHE_EPOCH[0] != epoch:
+        cache.clear()
+        _MM_MXFP8_LAUNCH_CACHE_EPOCH[0] = epoch
+    elif len(cache) >= _MM_MXFP8_LAUNCH_CACHE_CAPACITY:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = launch
+
+
+def _mm_mxfp8_cached_launch(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = False,
+    backend: str = "auto",
+) -> Optional[torch.Tensor]:
+    """mm_mxfp8's fast path: launch a cute-dsl call whose signature an earlier
+    call resolved, or return None to take the full path."""
+    if backend != "cute-dsl" or not _MM_MXFP8_LAUNCH_CACHE or api_call_hooks_enabled():
+        return None
+    epoch = AutoTuner.get().selection_epoch()
+    if epoch is None or epoch != _MM_MXFP8_LAUNCH_CACHE_EPOCH[0]:
+        return None
+    try:
+        key = _mm_mxfp8_launch_key(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+        )
+    except (AttributeError, TypeError):
+        return None  # not tensors; the full path reports the error
+    launch = _MM_MXFP8_LAUNCH_CACHE.get(key)
+    if launch is None:
+        return None
+    if out is None:
+        out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype)
+    launch(a, b, a_descale, b_descale, out)
+    return out
+
+
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_mxfp8_requirement,
@@ -7226,6 +7353,7 @@ def _heuristic_func_mm_mxfp8(
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    fast_path=_mm_mxfp8_cached_launch,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
@@ -7287,7 +7415,12 @@ def mm_mxfp8(
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). It memoizes
+          the launch it resolves for each call signature (shapes, strides,
+          dtypes, device), so a repeated call skips the checks, the runner
+          selection and the tactic resolution. The memo follows the
+          autotuner: it is dropped when the tuner's state changes and is not
+          used while tuning or while API logging is enabled.
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
@@ -7339,6 +7472,18 @@ def mm_mxfp8(
     )
 
     # NOTE: do NOT reshape swizzled 1D scales to 2D; it breaks the F8_128x4 layout.
+
+    tuner = AutoTuner.get()
+    # Read before the selection: a launch memoized under this epoch must come
+    # from tuner state at least as new as the epoch.
+    launch_epoch = tuner.selection_epoch() if backend == "cute-dsl" else None
+    launch_key = (
+        _mm_mxfp8_launch_key(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+        )
+        if launch_epoch is not None
+        else None
+    )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -7393,8 +7538,6 @@ def mm_mxfp8(
         built = backend_to_runner_factory[cur_backend]()
         runners.extend(built if isinstance(built, list) else [built])
 
-    tuner = AutoTuner.get()
-
     tuning_config = (
         _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
         if backends in (["cute-dsl"], ["cutedsl_low_latency"])
@@ -7416,7 +7559,15 @@ def mm_mxfp8(
     ):
         runner, tactic = runners[0], -1
 
-    runner(inputs=inputs, tactic=tactic)
+    make_launcher = (
+        getattr(runner, "make_launcher", None) if launch_key is not None else None
+    )
+    if make_launcher is None:
+        runner(inputs=inputs, tactic=tactic)
+    else:
+        launch = make_launcher(inputs, tactic)
+        launch(a, b, a_descale, b_descale, out)
+        _remember_mm_mxfp8_launch(launch_epoch, launch_key, launch)
     return out
 
 

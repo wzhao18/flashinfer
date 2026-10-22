@@ -1256,6 +1256,7 @@ def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
     heuristic_func: Optional[Callable] = None,
+    fast_path: Optional[Callable] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1286,6 +1287,13 @@ def backend_requirement(
         Should return an ordered list of runnable backends with the most preferred backend first.
         When decorated function is not autotuned, the first backend in the heuristic list will be run.
         When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
+    fast_path : callable, optional
+        A function with the decorated function's signature that is called first,
+        before any validation. It returns the result of a call it can serve from
+        what earlier, fully validated calls with the same argument signature
+        resolved (e.g. a memoized kernel launch), or ``None`` to take the regular
+        path. Serving a call is only valid when the checks are known to pass for
+        it, so the memo must be keyed on everything the checks read.
 
     Returns
     -------
@@ -1524,6 +1532,11 @@ def backend_requirement(
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
+
+            if fast_path is not None:
+                result = fast_path(*args, **kwargs)
+                if result is not None:
+                    return result
 
             if not skip_check:
                 # Apply defaults from the function signature for validation

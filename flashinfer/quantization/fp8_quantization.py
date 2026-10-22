@@ -259,6 +259,21 @@ def get_mxfp8_quantization_sm100_module():
     )
 
 
+@functools.cache
+def _get_mxfp8_quantize_cute_dsl():
+    """Import the CuTe-DSL MXFP8 quantize entry point (once per process)."""
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise RuntimeError(
+            "CuTe-DSL backend requested but CuTe-DSL is not available. "
+            "Please install nvidia-cutlass-dsl package."
+        )
+    from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+
+    return mxfp8_quantize_cute_dsl
+
+
 @flashinfer_api(trace=mxfp8_quantize_trace)
 def mxfp8_quantize(
     input: torch.Tensor,
@@ -324,14 +339,7 @@ def mxfp8_quantize(
         )
 
     if backend == "cute-dsl":
-        from ..cute_dsl import is_cute_dsl_available
-
-        if not is_cute_dsl_available():
-            raise RuntimeError(
-                "CuTe-DSL backend requested but CuTe-DSL is not available. "
-                "Please install nvidia-cutlass-dsl package."
-            )
-        from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+        mxfp8_quantize_cute_dsl = _get_mxfp8_quantize_cute_dsl()
 
         is_sf_swizzled_layout_cute = sf_swizzle_layout != SfLayout.layout_linear
         is_sf_8x4_layout_cute = sf_swizzle_layout == SfLayout.layout_8x4

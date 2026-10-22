@@ -1352,8 +1352,6 @@ def mxfp8_quantize_cute_dsl(
         ``float8_e4m3fn`` and ``scale_tensor`` is the UE8M0 scale-factor
         tensor (``uint8``).
     """
-    from ...utils import device_support_pdl, get_compute_capability
-
     assert input.dtype in (torch.float16, torch.bfloat16, torch.float32), (
         f"Input dtype must be float16, bfloat16, or float32, got {input.dtype}"
     )
@@ -1361,10 +1359,6 @@ def mxfp8_quantize_cute_dsl(
     assert alignment % SF_VEC_SIZE == 0, (
         f"alignment must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
     )
-
-    # Auto-detect PDL support based on device capability.
-    # If caller passes True explicitly, still check hardware support.
-    enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
 
     if input.dim() > 2:
         m = input.numel() // input.shape[-1]
@@ -1377,7 +1371,22 @@ def mxfp8_quantize_cute_dsl(
         f"K ({k}) must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
     )
 
-    padded_k = ((k + alignment - 1) // alignment) * alignment
+    # Everything below except the buffers depends only on the problem
+    # signature, so it is resolved once per signature (see
+    # _mxfp8_quantize_launch_plan) and repeated calls only allocate and launch.
+    get_kernel, kernel_key, padded_k, scale_output_size, launch_args = (
+        _mxfp8_quantize_launch_plan(
+            m,
+            k,
+            input.dtype,
+            input.get_device(),
+            bool(is_sf_swizzled_layout),
+            alignment,
+            enable_pdl,
+            bool(is_sf_8x4_layout),
+        )
+    )
+    kernel_fn, _ = get_kernel(*kernel_key)
 
     if padded_k > k:
         # Pad input with zeros - padding columns must be zero to produce zero FP8 output
@@ -1395,14 +1404,54 @@ def mxfp8_quantize_cute_dsl(
     if input_padded.data_ptr() % required_align != 0:
         input_padded = input_padded.clone(memory_format=torch.contiguous_format)
 
-    dtype_key = _TORCH_DTYPE_KEY[input.dtype]
+    fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
+    scale_output = torch.empty(
+        scale_output_size, dtype=torch.uint8, device=input.device
+    )
+    kernel_fn(input_padded, fp8_output, scale_output, *launch_args)
+
+    fp8_tensor = fp8_output.view(torch.float8_e4m3fn)
+
+    return fp8_tensor, scale_output
+
+
+@functools.lru_cache(maxsize=4096)
+def _mxfp8_quantize_launch_plan(
+    m: int,
+    k: int,
+    dtype: torch.dtype,
+    device_index: int,
+    is_sf_swizzled_layout: bool,
+    alignment: int,
+    enable_pdl: bool | None,
+    is_sf_8x4_layout: bool,
+) -> Tuple[Callable, tuple, int, int, Tuple[int, ...]]:
+    """Resolve the launch of :func:`mxfp8_quantize_cute_dsl` for one problem.
+
+    Returns ``(get_kernel, kernel_key, padded_k, scale_output_size,
+    launch_args)``: the kernel is ``get_kernel(*kernel_key)[0]`` (a lookup in
+    the compiled-kernel cache, which therefore keeps its own lifetime) and is
+    launched as ``kernel_fn(input, fp8_output, scale_output, *launch_args)``.
+    Depends only on the arguments and on device properties, so it is memoized.
+    """
+    from ...utils import device_support_pdl, get_compute_capability
+
+    device = torch.device("cuda", device_index)
+
+    # Auto-detect PDL support based on device capability.
+    # If caller passes True explicitly, still check hardware support.
+    enable_pdl = device_support_pdl(device) if enable_pdl is not False else False
+
+    padded_k = ((k + alignment - 1) // alignment) * alignment
+
+    dtype_key = _TORCH_DTYPE_KEY[dtype]
 
     # Cached device-specific target grid for grid size computation
-    is_sm107 = get_compute_capability(input.device) == (10, 7)
+    is_sm107 = get_compute_capability(device) == (10, 7)
     small_blocks = (
         is_sm107
         and is_sf_swizzled_layout
-        and _use_sm107_small_blocks(m, padded_k, input.dtype == torch.float32)
+        and _use_sm107_small_blocks(m, padded_k, dtype == torch.float32)
     )
     blocks_per_sm = _BLOCKS_PER_SM
     if (
@@ -1417,14 +1466,14 @@ def mxfp8_quantize_cute_dsl(
         and not small_blocks
         # FP32 linear is neutral-to-slightly-worse with a lower cap
         # (0.96-1.02x in cold-L2 sweeps); leave it at the default.
-        and not (not is_sf_swizzled_layout and input.dtype == torch.float32)
+        and not (not is_sf_swizzled_layout and dtype == torch.float32)
     ):
         # The swizzled kernel uses up to 1024 threads per CTA. On Rubin,
         # one persistent CTA per SM avoids extra waves; linear uses two.
         # Keep the original cap for medium 128x4 inputs: cold-L2 sweeps
         # show a crossover regression before 1024 rows / 8M elements.
         blocks_per_sm = 1 if is_sf_swizzled_layout else 2
-    target_grid = get_num_sm(input.device) * blocks_per_sm
+    target_grid = get_num_sm(device) * blocks_per_sm
 
     # Compute M-dependent values outside the cached kernel
     num_sf_blocks_per_row = padded_k // SF_VEC_SIZE
@@ -1446,19 +1495,20 @@ def mxfp8_quantize_cute_dsl(
         use_tile = (
             is_sm107
             and not is_sf_8x4_layout
-            and _use_sm107_tile128x4(m, padded_k, input.element_size())
+            and _use_sm107_tile128x4(m, padded_k, dtype.itemsize)
         )
         if use_tile:
             # SM107 only: 128-row tiles with shared-memory-staged scales.
-            kernel_fn, col_tiles = _get_compiled_kernel_mxfp8_tile128x4(
-                dtype_key, padded_k, enable_pdl, _TILE128X4_COL_GROUPS
-            )
+            get_kernel = _get_compiled_kernel_mxfp8_tile128x4
+            kernel_key: tuple = (dtype_key, padded_k, enable_pdl, _TILE128X4_COL_GROUPS)
+            _, col_tiles = get_kernel(*kernel_key)
             num_blocks = min(
                 (padded_m // ROW_TILE_SIZE) * col_tiles,
-                get_num_sm(input.device) * _TILE128X4_BLOCKS_PER_SM,
+                get_num_sm(device) * _TILE128X4_BLOCKS_PER_SM,
             )
         else:
-            kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
+            get_kernel = _get_compiled_kernel_mxfp8_swizzled
+            kernel_key = (
                 dtype_key,
                 padded_k,
                 enable_pdl,
@@ -1466,40 +1516,27 @@ def mxfp8_quantize_cute_dsl(
                 sf_layout,
                 small_blocks,
             )
+            _, rows_per_block = get_kernel(*kernel_key)
 
             num_blocks = min(
                 (padded_m + rows_per_block - 1) // rows_per_block, target_grid
             )
-
-        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
-        )
-
-        kernel_fn(input_padded, fp8_output, scale_output, m, padded_m, num_blocks)
+        launch_args: Tuple[int, ...] = (m, padded_m, num_blocks)
     else:
         # Linear layout: compute total_sf_blocks
         total_sf_blocks = m * num_sf_blocks_per_row
         scale_output_size = total_sf_blocks
 
-        kernel_fn, sf_blocks_per_tb = _get_compiled_kernel_mxfp8_linear(
-            dtype_key, padded_k, enable_pdl, use_2t
-        )
+        get_kernel = _get_compiled_kernel_mxfp8_linear
+        kernel_key = (dtype_key, padded_k, enable_pdl, use_2t)
+        _, sf_blocks_per_tb = get_kernel(*kernel_key)
 
         num_blocks = min(
             (total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb, target_grid
         )
+        launch_args = (total_sf_blocks, num_blocks)
 
-        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
-        )
-
-        kernel_fn(input_padded, fp8_output, scale_output, total_sf_blocks, num_blocks)
-
-    fp8_tensor = fp8_output.view(torch.float8_e4m3fn)
-
-    return fp8_tensor, scale_output
+    return get_kernel, kernel_key, padded_k, scale_output_size, launch_args
 
 
 __all__ = [

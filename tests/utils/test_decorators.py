@@ -534,3 +534,32 @@ def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
 
     monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     assert my_kernel(1) == "risky"  # gate on: heuristic may pick it
+
+
+def test_backend_requirement_fast_path():
+    """fast_path serves a call before any validation; None falls through."""
+    checked = []
+    served = {}
+
+    @supported_compute_capability([75, 80, 86, 89, 90, 100, 103, 110, 120, 121])
+    def _check(x, backend):
+        checked.append(x)
+        return x >= 0
+
+    def _fast_path(x, backend="a"):
+        return served.get((x, backend))
+
+    @backend_requirement({"a": _check}, fast_path=_fast_path)
+    def my_kernel(x, backend="a"):
+        return ("full", x)
+
+    # Miss: validated and run by the function itself.
+    assert my_kernel(1, skip_check=True) == ("full", 1)
+    assert checked == []
+
+    # Hit: neither validated nor run; skip_check is not passed on.
+    served[(1, "a")] = ("memo", 1)
+    assert my_kernel(1) == ("memo", 1)
+    assert my_kernel(1, backend="a") == ("memo", 1)
+    assert my_kernel(1, skip_check=False) == ("memo", 1)
+    assert checked == []

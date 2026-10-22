@@ -617,6 +617,17 @@ result = scale(x, 2.0)
 result = scale(x, 2.0, skip_check=True)
 ```
 
+#### `fast_path` Parameter
+
+`backend_requirement(..., fast_path=fn)` runs `fn` (same signature as the
+decorated function) before any validation. It returns the result of a call it
+can serve from what an earlier, fully validated call with the same argument
+signature resolved, or `None` to take the regular path. Key the memo on
+everything the checks read. Example: `mm_mxfp8`'s cute-dsl launch memo
+(`_mm_mxfp8_cached_launch` in `flashinfer/gemm/gemm_base.py`), which also
+follows `AutoTuner.selection_epoch()` and stays off while API logging is on
+(`api_call_hooks_enabled()`).
+
 #### Check Function Requirements
 
 Check functions must:

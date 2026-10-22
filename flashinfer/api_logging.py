@@ -2397,6 +2397,21 @@ def _attach_fi_trace(
     return wrapped
 
 
+def api_call_hooks_enabled() -> bool:
+    """Whether calls through ``@flashinfer_api`` do per-call work.
+
+    True with API logging (``FLASHINFER_LOGLEVEL`` > 0) or trace auto-dump
+    (``FLASHINFER_TRACE_DUMP``). A memoized fast path that serves a call
+    before it reaches the decorated function must not run while this is True,
+    or the call would go unlogged.
+    """
+    if _API_LOG_LEVEL != 0:
+        return True
+    # Same rule as flashinfer.trace.template._is_trace_dump_enabled, inlined to
+    # keep this per-call check to one environment lookup.
+    return os.environ.get("FLASHINFER_TRACE_DUMP", "0") not in ("0", "")
+
+
 def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
     """
     Decorator to FlashInfer's APIs.

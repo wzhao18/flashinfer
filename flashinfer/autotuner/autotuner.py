@@ -1500,6 +1500,70 @@ Override: TypeAlias = tuple[tuple[int, ...] | None, bool, int | None]
 OverrideStack: TypeAlias = list[Override]
 
 
+# Bumped after every change to state that a non-tuning ``choose_one`` reads
+# (winner caches, loaded configs, managed-store memos and attachment); read
+# through ``AutoTuner.selection_epoch``. Module-level so every tuner instance,
+# and copies of its dictionaries, invalidate memoized selections.
+_selection_epoch_counter = itertools.count(1)
+_selection_epoch = next(_selection_epoch_counter)
+
+
+def _bump_selection_epoch() -> None:
+    global _selection_epoch
+    _selection_epoch = next(_selection_epoch_counter)
+
+
+class _SelectionStateDict(dict):
+    """A dict whose mutations bump the selection epoch.
+
+    Holds the AutoTuner state that ``choose_one`` reads when it is not tuning,
+    so memoized selections (see ``AutoTuner.selection_epoch``) are invalidated
+    by every writer, including tests and tools that edit the caches directly.
+    The epoch is bumped after the mutation, so an epoch read before a lookup
+    never labels a selection made from older state.
+    """
+
+    __slots__ = ()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _bump_selection_epoch()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _bump_selection_epoch()
+
+    def __ior__(self, other):
+        result = super().__ior__(other)
+        _bump_selection_epoch()
+        return result
+
+    def clear(self):
+        super().clear()
+        _bump_selection_epoch()
+
+    def pop(self, *args):
+        try:
+            return super().pop(*args)
+        finally:
+            _bump_selection_epoch()
+
+    def popitem(self):
+        try:
+            return super().popitem()
+        finally:
+            _bump_selection_epoch()
+
+    def setdefault(self, key, default=None):
+        result = super().setdefault(key, default)
+        _bump_selection_epoch()
+        return result
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        _bump_selection_epoch()
+
+
 class _OverrideLocal(threading.local):
     stack: OverrideStack
 
@@ -1556,7 +1620,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
-        ] = {}
+        ] = _SelectionStateDict()
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate. Each shortlist is
@@ -1568,7 +1632,9 @@ class AutoTuner:
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
-        self._profiling_cache_policies: dict[tuple, tuple | None] = {}
+        self._profiling_cache_policies: dict[tuple, tuple | None] = (
+            _SelectionStateDict()
+        )
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -1601,8 +1667,8 @@ class AutoTuner:
                 )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
-        self._file_configs: dict[str, tuple[str, Any]] = {}
-        self._file_config_policies: dict[str, tuple[Any, ...]] = {}
+        self._file_configs: dict[str, tuple[str, Any]] = _SelectionStateDict()
+        self._file_config_policies: dict[str, tuple[Any, ...]] = _SelectionStateDict()
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1613,7 +1679,7 @@ class AutoTuner:
         # A persistent autotune_v2 context sets this last-wins so bare,
         # context-free serving keeps resolving to it; inside a context the
         # per-thread _v2_local record overrides it (see _active_managed_store).
-        self._managed_cache: Any | None = None
+        self._managed_cache_store: Any | None = None
         # Process-wide registry of managed store objects keyed by identity
         # (root, canonical-manifest): switching between identities reuses the
         # same store object (and its hit/miss memos) instead of rebuilding +
@@ -1628,7 +1694,9 @@ class AutoTuner:
         # free ProfilingCacheKey tuple (not the str() file_key), so the warm
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
-        self._managed_decoded: dict[tuple[str, str, tuple], ManagedCacheEntry] = {}
+        self._managed_decoded: dict[tuple[str, str, tuple], ManagedCacheEntry] = (
+            _SelectionStateDict()
+        )
         # Store identities already bulk-read into _managed_decoded, so a
         # re-attach of the same store does not re-scan the entries directory.
         self._preloaded_stores: set[tuple[str, str]] = set()
@@ -1636,7 +1704,7 @@ class AutoTuner:
         # the default (v1) partition is `profiling_cache` itself.  Winners
         # tuned under one measurement identity must not short-circuit
         # tuning under another (they may legitimately differ).
-        self._winner_partitions: dict[tuple, dict] = {}
+        self._winner_partitions: dict[tuple, dict] = _SelectionStateDict()
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
         # (op, runner, source) triples whose cached tactic failed
@@ -1713,6 +1781,41 @@ class AutoTuner:
             self._record_global_timer = None
 
         logger.debug(f"[Autotuner] use_global_timer: {self._use_global_timer}")
+
+    @property
+    def _managed_cache(self) -> Any | None:
+        """The ambient managed store (see ``__init__``)."""
+        return self._managed_cache_store
+
+    @_managed_cache.setter
+    def _managed_cache(self, store: Any | None) -> None:
+        self._managed_cache_store = store
+        _bump_selection_epoch()
+
+    def selection_epoch(self) -> int | None:
+        """Return a token for memoizing ``choose_one`` results on this thread.
+
+        Outside tuning, ``choose_one`` is a pure function of its arguments and
+        of the tuner state (in-memory winners, loaded configs, the managed
+        store). The returned integer changes whenever that state changes, so a
+        caller may reuse a selection, and anything derived from it, for
+        identical arguments while the epoch is unchanged.
+
+        Returns ``None`` when a selection must not be memoized: in tuning
+        mode, inside an ``autotune``/``autotune_v2`` context that overrides
+        the tuning buckets, skip_ops or measurement on this thread, or with
+        ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1`` (legacy bundled configs,
+        read per call).
+        """
+        if (
+            self.is_tuning_mode
+            or self._v2_local.active
+            or getattr(self._override_local, "stack", None)
+            or getattr(self._skip_ops_local, "stack", None)
+            or os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+        ):
+            return None
+        return _selection_epoch
 
     def _get_override_stack(self) -> OverrideStack:
         """Return the per-thread override stack, creating it on first access."""
@@ -1839,7 +1942,7 @@ class AutoTuner:
             return self.profiling_cache
         part = self._winner_partitions.get(key)
         if part is None:
-            part = self._winner_partitions[key] = {}
+            part = self._winner_partitions[key] = _SelectionStateDict()
         return part
 
     def _winner_cache_identity(self) -> tuple | None:
@@ -4009,6 +4112,7 @@ class AutoTuner:
             # cleared keys re-probe disk (the explicit invalidation point).
             for store in self._managed_stores.values():
                 store.clear_memo()
+            _bump_selection_epoch()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
