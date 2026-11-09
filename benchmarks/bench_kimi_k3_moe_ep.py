@@ -61,7 +61,9 @@ def _routing(mode, rank, tokens, seed):
     return ids.int(), (weights / weights.sum(-1, keepdim=True)).float()
 
 
-def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
+def _measure(
+    layer, tensors, workspace, *, warmups, samples, replays, world, profile=False
+):
     layer.warmup(tensors, workspace=workspace)
     output = torch.empty_like(tensors.hidden_states)
     caller = replace(tensors, output=output)
@@ -95,7 +97,9 @@ def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
             dist.all_reduce(values, op=dist.ReduceOp.MAX)
         elapsed = values.cpu().tolist()
         quantiles = statistics.quantiles(elapsed, n=20, method="inclusive")
+        kernels = _profile_kernels(graph, replays, world) if profile else None
         return output, {
+            **({"kernels_us": kernels} if kernels is not None else {}),
             "median_us": statistics.median(elapsed),
             "p05_us": quantiles[0],
             "p95_us": quantiles[18],
@@ -107,6 +111,24 @@ def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
     finally:
         graph = None
         torch.cuda.synchronize()
+
+
+def _profile_kernels(graph, replays, world):
+    """Average device time per kernel name over ``replays`` graph replays (torch profiler, CUDA activity)."""
+    if world > 1:
+        dist.barrier()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        for _ in range(replays):
+            graph.replay()
+        torch.cuda.synchronize()
+    totals = {}
+    for event in profiler.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA:
+            name = event.name[:120]
+            totals[name] = totals.get(name, 0.0) + event.device_time
+    return {name: round(total / replays, 2) for name, total in sorted(totals.items(), key=lambda item: -item[1])}
 
 
 def main():
@@ -124,6 +146,11 @@ def main():
         "balanced / random / zipf = DeepGEMM bench_megamoe routing",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="also report the average device time per kernel of one graph replay (torch profiler)",
+    )
     parser.add_argument(
         "--kimi-knobs",
         type=lambda value: json.loads(
@@ -287,6 +314,7 @@ def main():
                                 samples=args.samples,
                                 replays=args.replays,
                                 world=world,
+                                profile=args.profile,
                             )
                             sample = replace(
                                 tensors,
