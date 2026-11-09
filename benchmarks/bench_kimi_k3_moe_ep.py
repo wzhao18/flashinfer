@@ -167,17 +167,22 @@ def main():
                 )
                 if args.current_tile is not None:
                     options["knobs"] = {"mma_tiler_mnk": tuple(args.current_tile)}
-                config = (
-                    moe_ep.Sm100_KimiK3_MegaMoeConfig(
-                        quant_kind=kind, fast_situ=False, **options
+                rubin = torch.cuda.get_device_capability() == (10, 7)
+                if args.provider == "kimi":
+                    kimi_config = (
+                        moe_ep.Sm107_KimiK3_MegaMoeConfig
+                        if rubin
+                        else moe_ep.Sm100_KimiK3_MegaMoeConfig
                     )
-                    if args.provider == "kimi"
-                    else moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                    config = kimi_config(quant_kind=kind, fast_situ=False, **options)
+                elif rubin:
+                    config = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**options)
+                else:
+                    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                         kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
                         fast_math=False,
                         **options,
                     )
-                )
                 layer = moe_ep.MoEEpMegaLayer(
                     bootstrap=moe_ep.BootstrapConfig(
                         world_size=world,
