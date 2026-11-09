@@ -181,7 +181,7 @@ def _check(actual, expected):
 @pytest.mark.parametrize("wire", ["bf16", "mxfp8"])
 def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
     rank, world = _runtime()
-    from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as native
+    from flashinfer.moe_ep.kernel_src.sm107 import _kimi_k3_megamoe as native
 
     calibration = {}
     if kind == "nvfp4":
@@ -347,7 +347,7 @@ def test_kimi_reducer_skips_poisoned_masked_slots(wire):
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as native
+    from flashinfer.moe_ep.kernel_src.sm107 import _kimi_k3_megamoe as native
 
     dtype = torch.bfloat16 if wire == "bf16" else torch.float8_e4m3fn
     codes = torch.full((3, TOPK, HIDDEN), float("nan"), device="cuda").to(dtype)
