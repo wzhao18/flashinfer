@@ -126,9 +126,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--kimi-knobs",
-        type=json.loads,
+        type=lambda value: json.loads(
+            Path(value[1:]).read_text() if value.startswith("@") else value
+        ),
         default=None,
-        help="JSON dict of fixed Kimi knobs (provider=kimi), e.g. a tile or flag-batch override",
+        help="JSON dict (or @file.json) of fixed Kimi knobs (provider=kimi), e.g. a tile override",
     )
     parser.add_argument(
         "--quant-kind", choices=["all", "nvfp4", "mxfp4_mxfp8"], default="all"
