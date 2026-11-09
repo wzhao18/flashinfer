@@ -176,6 +176,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--dump-output",
+        type=Path,
+        default=None,
+        help="directory: each rank saves its measured output per token count (bitwise A/B between builds)",
+    )
+    parser.add_argument(
         "--calls-per-graph",
         type=int,
         default=1,
@@ -394,6 +400,12 @@ def main():
                                 topk_weights=tensors.topk_weights[:8],
                             )
                             _check(output[:8], _reference(sample, kind, wire))
+                            if args.dump_output is not None:
+                                args.dump_output.mkdir(parents=True, exist_ok=True)
+                                torch.save(
+                                    output.cpu(),
+                                    args.dump_output / f"out_r{rank}_{kind}_{wire}_{tokens}.pt",
+                                )
                             row = {
                                 "provider": args.provider,
                                 "kernel_selector": config.kernel_name,
