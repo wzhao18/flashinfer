@@ -161,6 +161,17 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--current-variant",
+        choices=["inference", "genphase", "auto"],
+        default=None,
+        help="SM107 stock kernel_variant (provider=current on SM107)",
+    )
+    parser.add_argument(
+        "--kimi-fast-situ",
+        action="store_true",
+        help="Kimi fast_situ=True (production SiTU core; can change output bits)",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="also report the average device time per kernel of one graph replay (torch profiler)",
@@ -223,7 +234,8 @@ def main():
         "topk": 16,
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
-        "fast_situ": False,
+        "fast_situ": args.kimi_fast_situ,
+        "current_variant": args.current_variant,
         "fast_math": False,
         "warmups": args.warmups,
         "samples": args.samples,
@@ -276,13 +288,17 @@ def main():
                             key: tuple(value) if isinstance(value, list) else value
                             for key, value in args.kimi_knobs.items()
                         }
-                    config = kimi_config(quant_kind=kind, fast_situ=False, **options)
+                    config = kimi_config(
+                        quant_kind=kind, fast_situ=args.kimi_fast_situ, **options
+                    )
                 elif rubin:
                     # The SM107 kernel has no finalize mode; use its tuned knob cache by default.
                     rubin_options = {
                         k: v for k, v in options.items() if k != "finalize_mode"
                     }
                     rubin_options.setdefault("knobs", "cache")
+                    if args.current_variant is not None:
+                        rubin_options["kernel_variant"] = args.current_variant
                     config = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                         **rubin_options
                     )
