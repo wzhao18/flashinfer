@@ -61,6 +61,20 @@ def _routing(mode, rank, tokens, seed):
     return ids.int(), (weights / weights.sum(-1, keepdim=True)).float()
 
 
+def _bench_weights(rank, world, kind, provider, rubin):
+    """Test weights; the SM107 stock kernel requires typed E4M3 block scales (same bytes)."""
+    if not (provider == "current" and rubin):
+        return _weights(rank, world, kind)
+    count = EXPERTS // world
+    from tests.moe_ep.test_sm107_kimi_k3 import INTERMEDIATE, _sparse_weight
+
+    w13, s13 = _sparse_weight(2 * INTERMEDIATE, HIDDEN, count, rank * count, kind)
+    w2, s2 = _sparse_weight(HIDDEN, INTERMEDIATE, count, rank * count, kind)
+    return moe_ep.MoEWeightPack(
+        w13, w2, s13.view(torch.float8_e4m3fn), s2.view(torch.float8_e4m3fn)
+    )
+
+
 def _measure(
     layer, tensors, workspace, *, warmups, samples, replays, world, profile=False
 ):
@@ -291,7 +305,7 @@ def main():
                         max_tokens_per_rank=max(args.tokens),
                         token_hidden_size=HIDDEN,
                     ),
-                    weights=_weights(rank, world, kind),
+                    weights=_bench_weights(rank, world, kind, args.provider, rubin),
                     backend=moe_ep.MegaConfig(megakernel=config, quantize_input=True),
                 )
                 try:
