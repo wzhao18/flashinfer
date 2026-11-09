@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 
 from .smem_workspace import SmemRegion
 

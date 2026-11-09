@@ -15,16 +15,28 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import moe_ep
-from tests.moe_ep.test_sm100_kimi_k3 import (
-    EXPERTS,
-    HIDDEN,
-    _alpha,
-    _check,
-    _inputs,
-    _reference,
-    _runtime,
-    _weights,
-)
+if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7):
+    from tests.moe_ep.test_sm107_kimi_k3 import (  # noqa: E402
+        EXPERTS,
+        HIDDEN,
+        _alpha,
+        _check,
+        _inputs,
+        _reference,
+        _runtime,
+        _weights,
+    )
+else:
+    from tests.moe_ep.test_sm100_kimi_k3 import (  # noqa: E402
+        EXPERTS,
+        HIDDEN,
+        _alpha,
+        _check,
+        _inputs,
+        _reference,
+        _runtime,
+        _weights,
+    )
 
 
 def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):

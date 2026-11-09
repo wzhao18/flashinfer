@@ -9,7 +9,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils
 import torch
 import torch.distributed as dist
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.typing import AddressSpace
 
 from ..src.api import ImplDesc, ProblemDesc
