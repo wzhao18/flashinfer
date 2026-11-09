@@ -62,7 +62,7 @@ def _routing(mode, rank, tokens, seed):
 
 
 def _bench_weights(rank, world, kind, provider, rubin):
-    """Test weights; the SM107 stock kernel requires typed E4M3 block scales (same bytes)."""
+    """Test weights; the SM107 stock kernels require typed E4M3 / E8M0 block scales (same bytes)."""
     if not (provider == "current" and rubin):
         return _weights(rank, world, kind)
     count = EXPERTS // world
@@ -70,9 +70,8 @@ def _bench_weights(rank, world, kind, provider, rubin):
 
     w13, s13 = _sparse_weight(2 * INTERMEDIATE, HIDDEN, count, rank * count, kind)
     w2, s2 = _sparse_weight(HIDDEN, INTERMEDIATE, count, rank * count, kind)
-    return moe_ep.MoEWeightPack(
-        w13, w2, s13.view(torch.float8_e4m3fn), s2.view(torch.float8_e4m3fn)
-    )
+    scale_dtype = torch.float8_e4m3fn if kind == "nvfp4" else torch.float8_e8m0fnu
+    return moe_ep.MoEWeightPack(w13, w2, s13.view(scale_dtype), s2.view(scale_dtype))
 
 
 def _measure(
@@ -230,9 +229,13 @@ def main():
     ):
         parser.error("--kimi-knobs requires provider=kimi and a JSON object")
     if args.provider == "current":
-        if args.quant_kind not in ("all", "nvfp4") or args.wire not in ("all", "bf16"):
-            parser.error("the current-provider comparison supports NVFP4/BF16 only")
-        args.quant_kind, args.wire = "nvfp4", "bf16"
+        rubin_device = torch.cuda.get_device_capability() == (10, 7)
+        kinds_ok = ("nvfp4", "mxfp4_mxfp8") if rubin_device else ("nvfp4",)
+        if args.quant_kind not in ("all", *kinds_ok) or args.wire not in ("all", "bf16"):
+            parser.error(f"the current-provider comparison supports {kinds_ok} with BF16 combine")
+        if args.quant_kind == "all":
+            args.quant_kind = "nvfp4"
+        args.wire = "bf16"
     if args.calls_per_graph < 1 or (
         args.max_tokens is not None and args.max_tokens < max(args.tokens)
     ):
@@ -333,9 +336,12 @@ def main():
                     rubin_options.setdefault("knobs", "cache")
                     if args.current_variant is not None:
                         rubin_options["kernel_variant"] = args.current_variant
-                    config = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                        **rubin_options
+                    stock_config = (
+                        moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+                        if kind == "nvfp4"
+                        else moe_ep.Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
                     )
+                    config = stock_config(**rubin_options)
                 else:
                     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                         kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
