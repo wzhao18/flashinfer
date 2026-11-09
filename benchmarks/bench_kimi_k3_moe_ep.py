@@ -88,6 +88,7 @@ def _measure(
     execution_mode="cuda_graph",
     output_mode="caller",
     profile=False,
+    calls_per_graph=1,
 ):
     layer.warmup(tensors, workspace=workspace)
     output = (
@@ -100,7 +101,8 @@ def _measure(
     if execution_mode == "cuda_graph":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = layer(caller, workspace=workspace)
+            for _ in range(calls_per_graph):
+                output = layer(caller, workspace=workspace)
     try:
         if graph is not None:
             graph.replay()
@@ -118,13 +120,17 @@ def _measure(
             begin = time.perf_counter_ns()
             for _ in range(replays):
                 if graph is None:
-                    output = layer(caller, workspace=workspace)
+                    # Same calls per replay as a captured graph.
+                    for _ in range(calls_per_graph):
+                        output = layer(caller, workspace=workspace)
                 else:
                     graph.replay()
             host_elapsed.append((time.perf_counter_ns() - begin) / 1000 / replays)
             end.record()
             end.synchronize()
-            elapsed.append(start.elapsed_time(end) * 1000 / replays)
+            elapsed.append(
+                start.elapsed_time(end) * 1000 / (replays * calls_per_graph)
+            )
         values = torch.tensor(elapsed, dtype=torch.float64, device="cuda")
         rank_samples = [elapsed]
         if world > 1:
@@ -134,7 +140,7 @@ def _measure(
         elapsed = values.cpu().tolist()
         quantiles = statistics.quantiles(elapsed, n=20, method="inclusive")
         kernels = (
-            _profile_kernels(graph, replays, world)
+            _profile_kernels(graph, replays * calls_per_graph, world)
             if profile and graph is not None
             else None
         )
@@ -189,6 +195,18 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--calls-per-graph",
+        type=int,
+        default=1,
+        help="layer calls captured back to back in one CUDA graph (DeepGEMM bench_megamoe uses 10)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="fleet max_tokens_per_rank (tactic bucket / router geometry); default max(--tokens)",
+    )
+    parser.add_argument(
         "--current-variant",
         choices=["inference", "genphase", "auto"],
         default=None,
@@ -237,6 +255,10 @@ def main():
         if args.quant_kind not in ("all", "nvfp4") or args.wire not in ("all", "bf16"):
             parser.error("the current-provider comparison supports NVFP4/BF16 only")
         args.quant_kind, args.wire = "nvfp4", "bf16"
+    if args.calls_per_graph < 1 or (
+        args.max_tokens is not None and args.max_tokens < max(args.tokens)
+    ):
+        parser.error("--calls-per-graph >= 1 and --max-tokens >= every --tokens")
     if min(args.tokens) < 1 or args.warmups < 1 or args.samples < 2 or args.replays < 1:
         parser.error(
             "tokens/warmups/replays must be positive; samples must be at least two"
@@ -274,6 +296,8 @@ def main():
         "warmups": args.warmups,
         "samples": args.samples,
         "replays_per_sample": args.replays,
+        "calls_per_graph": args.calls_per_graph,
+        "max_tokens_per_rank": args.max_tokens,
         "results": [],
     }
     if rank == 0:
@@ -352,7 +376,7 @@ def main():
                     ),
                     fleet_params=moe_ep.FleetParams(
                         num_experts=EXPERTS,
-                        max_tokens_per_rank=max(args.tokens),
+                        max_tokens_per_rank=args.max_tokens or max(args.tokens),
                         token_hidden_size=HIDDEN,
                     ),
                     weights=_bench_weights(rank, world, kind, args.provider, rubin),
@@ -381,6 +405,7 @@ def main():
                                 execution_mode=args.execution_mode,
                                 output_mode=args.output_mode,
                                 profile=args.profile,
+                                calls_per_graph=args.calls_per_graph,
                             )
                             sample = replace(
                                 tensors,
