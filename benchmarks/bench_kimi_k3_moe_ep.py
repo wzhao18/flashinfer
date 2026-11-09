@@ -188,7 +188,14 @@ def main():
                     )
                     config = kimi_config(quant_kind=kind, fast_situ=False, **options)
                 elif rubin:
-                    config = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**options)
+                    # The SM107 kernel has no finalize mode; use its tuned knob cache by default.
+                    rubin_options = {
+                        k: v for k, v in options.items() if k != "finalize_mode"
+                    }
+                    rubin_options.setdefault("knobs", "cache")
+                    config = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                        **rubin_options
+                    )
                 else:
                     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                         kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
