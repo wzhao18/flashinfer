@@ -95,6 +95,12 @@ def main():
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[256, 2048, 8192])
     parser.add_argument(
+        "--kimi-knobs",
+        type=json.loads,
+        default=None,
+        help="JSON dict of fixed Kimi knobs (provider=kimi), e.g. a tile or flag-batch override",
+    )
+    parser.add_argument(
         "--quant-kind", choices=["all", "nvfp4", "mxfp4_mxfp8"], default="all"
     )
     parser.add_argument("--wire", choices=["all", "bf16", "mxfp8"], default="all")
@@ -107,6 +113,10 @@ def main():
         args.provider != "current" or min(args.current_tile) < 1
     ):
         parser.error("--current-tile requires provider=current and positive M N K")
+    if args.kimi_knobs is not None and (
+        args.provider != "kimi" or not isinstance(args.kimi_knobs, dict)
+    ):
+        parser.error("--kimi-knobs requires provider=kimi and a JSON object")
     if args.provider == "current":
         if args.quant_kind not in ("all", "nvfp4") or args.wire not in ("all", "bf16"):
             parser.error("the current-provider comparison supports NVFP4/BF16 only")
@@ -124,6 +134,7 @@ def main():
         "api": "flashinfer.moe_ep.MoEEpMegaLayer",
         "provider": args.provider,
         "current_tile": args.current_tile,
+        "kimi_knobs": args.kimi_knobs,
         "measurement": "warm graph forward, CUDA events, slowest EP rank per sample",
         "weights": "deterministic packed sparse layout-test weights",
         "routing": "16 valid routes per token, spread across EP ranks",
@@ -186,6 +197,11 @@ def main():
                         if rubin
                         else moe_ep.Sm100_KimiK3_MegaMoeConfig
                     )
+                    if args.kimi_knobs:
+                        options["knobs"] = {
+                            key: tuple(value) if isinstance(value, list) else value
+                            for key, value in args.kimi_knobs.items()
+                        }
                     config = kimi_config(quant_kind=kind, fast_situ=False, **options)
                 elif rubin:
                     # The SM107 kernel has no finalize mode; use its tuned knob cache by default.
