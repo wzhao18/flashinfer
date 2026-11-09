@@ -40,6 +40,28 @@ else:
     )
 
 
+def _routing(mode, rank, tokens, seed):
+    """Expert ids and weights for --routing; random / zipf / balanced match DeepGEMM bench_megamoe.make_routing."""
+    g = torch.Generator(device="cuda").manual_seed(seed * 1000 + rank)
+    topk = 16
+    if mode == "balanced":
+        gid = rank * tokens + torch.arange(tokens, device="cuda")
+        ids = (gid[:, None] * topk + torch.arange(topk, device="cuda")[None, :]) % EXPERTS
+    elif mode == "random":
+        scores = torch.randn((tokens, EXPERTS), device="cuda", generator=g)
+        ids = scores.topk(topk, dim=-1).indices
+    elif mode == "zipf":
+        p = 1.0 / torch.arange(1, EXPERTS + 1, device="cuda", dtype=torch.float) ** 1.25
+        perm = torch.randperm(
+            EXPERTS, device="cuda", generator=torch.Generator(device="cuda").manual_seed(seed)
+        )
+        ids = torch.multinomial(p[perm].expand(tokens, -1), topk, replacement=False, generator=g)
+    else:
+        raise ValueError(mode)
+    weights = torch.rand((tokens, topk), device="cuda", generator=g) + 0.1
+    return ids.int(), (weights / weights.sum(-1, keepdim=True)).float()
+
+
 def _measure(
     layer,
     tensors,
@@ -120,6 +142,14 @@ def main():
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[256, 2048, 8192])
     parser.add_argument(
+        "--routing",
+        choices=["pattern", "balanced", "random", "zipf"],
+        default="pattern",
+        help="pattern = the test inputs (one route per rank, local expert = row %% experts per rank); "
+        "balanced / random / zipf = DeepGEMM bench_megamoe routing",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
         "--kimi-knobs",
         type=json.loads,
         default=None,
@@ -168,7 +198,8 @@ def main():
         "execution_mode": args.execution_mode,
         "output_mode": args.output_mode,
         "weights": "deterministic packed sparse layout-test weights",
-        "routing": "16 valid routes per token, spread across EP ranks",
+        "routing": args.routing,
+        "seed": args.seed,
         "input": "BF16; includes input quantization, routing, compute and combine",
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
@@ -270,6 +301,13 @@ def main():
                         workspace = layer.create_workspace(tokens)
                         try:
                             tensors = _inputs(tokens, rank, world, 0, mask_routes=False)
+                            if args.routing != "pattern":
+                                ids, weights = _routing(
+                                    args.routing, rank, tokens, args.seed
+                                )
+                                tensors = replace(
+                                    tensors, topk_ids=ids, topk_weights=weights
+                                )
                             output, timing = _measure(
                                 layer,
                                 tensors,
