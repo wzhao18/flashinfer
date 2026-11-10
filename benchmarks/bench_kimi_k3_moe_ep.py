@@ -176,6 +176,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--stamp-buffer",
+        action="store_true",
+        help="diagnostic builds only: allocate an int64 stamp buffer, export its address as K3S_BUF before kernels are "
+        "traced, and add the last call's stamps to each result row",
+    )
+    parser.add_argument(
         "--dump-output",
         type=Path,
         default=None,
@@ -251,6 +257,10 @@ def main():
             "tokens/warmups/replays must be positive; samples must be at least two"
         )
     rank, world = _runtime()
+    stamp_buffer = None
+    if args.stamp_buffer:
+        stamp_buffer = torch.zeros(4096, dtype=torch.int64, device="cuda")
+        os.environ["K3S_BUF"] = str(stamp_buffer.data_ptr())
     if args.provider == "current" and world == 1:
         os.environ["MEGA_NO_DIST"] = "1"
     kinds = ["nvfp4", "mxfp4_mxfp8"] if args.quant_kind == "all" else [args.quant_kind]
@@ -406,7 +416,17 @@ def main():
                                     output.cpu(),
                                     args.dump_output / f"out_r{rank}_{kind}_{wire}_{tokens}.pt",
                                 )
+                            stamps = None
+                            if stamp_buffer is not None:
+                                torch.cuda.synchronize()
+                                local = stamp_buffer.cpu().tolist()
+                                stamps = [None] * world
+                                if world > 1:
+                                    dist.all_gather_object(stamps, local)
+                                else:
+                                    stamps = [local]
                             row = {
+                                **({"stamps": stamps} if stamps is not None else {}),
                                 "provider": args.provider,
                                 "kernel_selector": config.kernel_name,
                                 "quant_kind": kind,
