@@ -19,6 +19,7 @@ from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tme
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.iket_compat import iket
 from .....helpers.smem_workspace import SmemWorkspace
+from .....helpers.software_sync import NvlinkBarrier
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
@@ -419,6 +420,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
+        # Tail-reset state is double-buffered by call parity, so the tail needs a
+        # single NVLink barrier (TokenComm.reset_tail). The NVLink barrier phase
+        # counter advances once per call and supplies the parity.
+        device_workspace.enable_tail_parity(NvlinkBarrier.phase_counter_region)
         device_workspace.finalize()
         return device_workspace
 
@@ -912,7 +917,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         smem_allocator = utils.SmemAllocator()
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
-        self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        self._device_workspace.assign_device_members(local_workspace, shared_workspace, load_tail_parity=True)
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
         if cutlass.const_expr(isinstance(self.hidden_size, int)):

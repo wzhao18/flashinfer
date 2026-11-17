@@ -493,7 +493,7 @@ class _MetadataPushRouter(KernelComponent):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
 
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, load_tail_parity=True)
         self._device_workspace = device_workspace
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self._router_local_rank = local_rank
@@ -2743,11 +2743,29 @@ class TokenCommNonDeterministic(KernelComponent):
 
     @cute.jit
     def reset_tail(self) -> None:
-        """Reset communication state with the four token-in transfer warps."""
+        """Clear the next call's communication state, then one all-rank NVLink barrier.
+
+        The workspace double-buffers every tail-reset region by call parity, so this
+        call clears the copy the next call uses. Nobody reads or writes that copy
+        until a peer has passed this call's barrier, and the clear is ordered before
+        this rank's barrier signal (grid sync + fence.acq_rel.sys), so the second
+        all-rank round that used to publish the reset is gone.
+        """
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
-        iket.range_push("tail.nvlink_drain")
+        iket.range_push("tail.reset_workspace")
+        if cutlass.const_expr(self.tail_reset_single_cta):
+            if self._linear_cta_idx == Int32(0):
+                self._device_workspace.reset_tail_space("shared", transfer_thread_idx, self.transfer_thread_count)
+                self._device_workspace.reset_tail_space("local", transfer_thread_idx, self.transfer_thread_count)
+        else:
+            total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
+            global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+        iket.range_pop()
+        iket.range_push("tail.nvlink_barrier")
         self._nvlink_barrier.arrive_and_wait(
             self.transfer_thread_count,
             Int32(self.promised_launchable_sm_count),
@@ -2757,35 +2775,10 @@ class TokenCommNonDeterministic(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
-        iket.range_push("tail.reset_workspace")
-        if cutlass.const_expr(self.tail_reset_single_cta):
-            # The peer wait and phase increment are performed by thread0.
-            # Join all four transfer warps before clearing peer-visible state
-            # or loading the next peer-barrier phase without a grid prologue.
-            if self._linear_cta_idx == Int32(0):
-                self._nvlink_barrier._cta_rendezvous(self.transfer_thread_count)
-                self._device_workspace.reset_tail_space("shared", transfer_thread_idx, self.transfer_thread_count)
-                self._device_workspace.reset_tail_space("local", transfer_thread_idx, self.transfer_thread_count)
-        else:
-            total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
-            global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
-            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
-        iket.range_pop()
-        iket.range_push("tail.nvlink_publish")
-        self._nvlink_barrier.arrive_and_wait(
-            self.transfer_thread_count,
-            Int32(self.promised_launchable_sm_count),
-            self._linear_cta_idx,
-            transfer_thread_idx,
-            prologue_grid_sync=not self.tail_reset_single_cta,
-            epilogue_grid_sync=False,
-        )
-        iket.range_pop()
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(
-                2,
+                1,
                 self.transfer_thread_count,
                 Int32(self.promised_launchable_sm_count),
                 self._linear_cta_idx,
