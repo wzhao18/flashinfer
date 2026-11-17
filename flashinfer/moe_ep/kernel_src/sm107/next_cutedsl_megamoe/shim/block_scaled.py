@@ -60,6 +60,8 @@ _KIND_TABLE: dict = {
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
 
 _SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+# die_split (two-ended expert claim over die-local weights) up to this many expected rows per local expert.
+_DIE_SPLIT_MAX_ROWS_PER_EXPERT = 1536
 
 
 def _require_sm107() -> None:
@@ -836,9 +838,18 @@ class Sm107BlockScaledSymmBuffer:
             # Multi-die GPU: the weight preprocessing places the lower half of the local experts on locality
             # domain 0 and the upper half on domain 1 (die_local.py); the scheduler then lets each die claim
             # from its own end of the expert-ordered work streams.
+            # Per-shape: at large expected rows per local expert (deep prefill) the work streams are long and
+            # the weight reads amortize; there the two-ended claim measured slower (EP16 T8192, 2340 rows: +3.9%),
+            # so it is used only up to _DIE_SPLIT_MAX_ROWS_PER_EXPERT.
             from .die_local import locality_domain_count
 
-            if locality_domain_count(torch.cuda.current_device()) >= 2:
+            rows_per_expert = (
+                cfg.max_tokens_per_rank * cfg.world_size * cfg.num_topk / cfg.num_total_experts
+            )
+            if (
+                locality_domain_count(torch.cuda.current_device()) >= 2
+                and rows_per_expert <= _DIE_SPLIT_MAX_ROWS_PER_EXPERT
+            ):
                 impl_fields["die_split"] = True
         if cfg.fallback_cluster_shape_mn is not None:
             impl_fields["fallback_cluster_shape_mn"] = tuple(
