@@ -242,7 +242,26 @@ def _device_key(device: Optional[str]) -> str:
     return "sm107:" + (device if device is not None else _current_device_name())
 
 
+# Parsed cache files keyed by (path, mtime, size): a workspace with batch-size variants resolves the knobs of
+# up to ~1000 capacities at allocation, and re-parsing the file (on a network filesystem) per lookup took minutes.
+_PARSED_ENTRIES: Dict[tuple, List[Dict[str, Any]]] = {}
+
+
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _parse_entries(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    entries = _PARSED_ENTRIES.get(key)
+    if entries is None:
+        entries = _parse_entries(path)
+        _PARSED_ENTRIES.clear()
+        _PARSED_ENTRIES[key] = entries
+    return list(entries)
+
+
+def _parse_entries(path: str) -> List[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
 
     try:
