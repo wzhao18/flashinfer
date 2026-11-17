@@ -419,7 +419,7 @@ def _workspace():
     ws._launch_key = None
     ws._launch_kwargs = None
     ws._routing_checks = {}
-    ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
+    ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b, *bindings: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)
     ws.output_activation = torch.zeros(4, 128)
@@ -800,3 +800,157 @@ def test_ikr_requires_early_weighting():
             reduce_topk_in_kernel=True,
             apply_routing_weights_before_fc2=False,
         )
+
+
+
+def _kimi_config(**kw):
+    return _config(
+        **(
+            dict(
+                num_total_experts=896,
+                max_tokens_per_rank=8192,
+                num_topk=16,
+                hidden=3584,
+                intermediate=3072,
+                world_size=8,
+                quant_kind="nvfp4",
+                mma_tiler_mnk=(256, 256, 256),
+                cluster_shape_mn=(4, 1),
+                fallback_cluster_shape_mn=(2, 1),
+                schedule_policy=("phase_interleave", None),
+                work_id_mode="atomic_counter",
+            )
+            | kw
+        )
+    )
+
+
+def _policy_capacity(cfg):
+    """config_for_capacity of a fixed-knob workspace with the C3 N-tile rule (backend per-shape policy)."""
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import default_knobs
+
+    def config_for_capacity(tokens):
+        tile = default_knobs(
+            tokens,
+            quant_kind="nvfp4" if cfg.quant_kind == "nvfp4" else "mxfp4_mxfp8",
+            world_size=cfg.world_size,
+            topk=cfg.num_topk,
+            num_experts=cfg.num_total_experts,
+        )["mma_tiler_mnk"]
+        return dataclasses.replace(cfg, max_tokens_per_rank=tokens, mma_tiler_mnk=tile)
+
+    return config_for_capacity
+
+
+# vLLM K3.1 VR decode CUDA-graph capture sizes (c512 config: spec k=3, multiples of 4 up to 512).
+_VLLM_CAPTURE_SIZES = list(range(4, 513, 4))
+
+
+@pytest.mark.parametrize("kind,world", [("nvfp4", 8), ("nvfp4", 16), ("mxfp4_mxfp8", 8), ("mxfp4_mxfp8", 16)])
+def test_variant_classes_dedupe_by_policy_key(kind, world, monkeypatch):
+    pytest.importorskip("cutlass")
+    monkeypatch.setattr(block_scaled, "_die_split_policy", lambda c: c.schedule_policy[0] == "phase_interleave")
+    tile_k = 256 if kind == "nvfp4" else 128
+    cfg = _kimi_config(quant_kind=kind, world_size=world, mma_tiler_mnk=(256, 256, tile_k))
+    classes = block_scaled.variant_classes(cfg, _policy_capacity(cfg))
+    # Classes tile 1..1024 contiguously, each compiled at its largest batch size.
+    assert classes[0].lo == 1 and classes[-1].hi == 1024
+    assert all(a.hi + 1 == b.lo for a, b in zip(classes, classes[1:]))
+    assert [c.slot for c in classes] == list(range(1, len(classes) + 1))
+    for c in classes:
+        assert c.config.max_tokens_per_rank == c.hi
+        # Every batch size of a class has the class's compile-time key.
+        key = block_scaled.variant_policy_key(c.config)
+        for tokens in {c.lo, (c.lo + c.hi) // 2, c.hi}:
+            assert block_scaled.variant_policy_key(_policy_capacity(cfg)(tokens)) == key
+    # Router geometry classes (pow2 route blocks of 2048..16384, landing, dynamic claim) plus N-tile switches:
+    # a handful of kernels serve all 128 vLLM capture sizes.
+    used = {next(c.hi for c in classes if c.lo <= t <= c.hi) for t in _VLLM_CAPTURE_SIZES}
+    assert 3 <= len(used) <= 5, used
+    assert len(classes) <= 7
+
+
+def test_variant_classes_none_without_eligibility():
+    assert block_scaled.variant_classes(_kimi_config(max_tokens_per_rank=1), lambda t: None) == ()
+    assert block_scaled.variant_classes(
+        _kimi_config(reduce_topk_in_kernel=True), lambda t: None
+    ) == ()
+    genphase = SimpleNamespace(
+        kernel_variant="genphase", batch_invariant=False, reduce_topk_in_kernel=False, max_tokens_per_rank=1024
+    )
+    assert block_scaled.variant_classes(genphase, lambda t: None) == ()
+
+
+def _fake_variant(cfg, lo, hi, slot, compiled):
+    v = object.__new__(Sm107BlockScaledSymmBuffer)
+    v.config = dataclasses.replace(cfg, max_tokens_per_rank=hi)
+    v._variant_class = block_scaled._VariantClass(lo=lo, hi=hi, config=v.config, slot=slot)
+    v._compiled = object() if compiled else None
+    v.topk_idx = torch.full((hi,), hi)
+    return v
+
+
+def test_select_live_tokens_picks_compiled_class_ep_uniformly():
+    ws = object.__new__(Sm107BlockScaledSymmBuffer)
+    ws.config = _kimi_config()
+    ws.topk_idx = torch.zeros(1)
+    ws._compiled = object()
+    ws._variants = (
+        _fake_variant(ws.config, 1, 128, 1, True),
+        _fake_variant(ws.config, 129, 256, 2, True),
+        _fake_variant(ws.config, 257, 512, 3, False),  # not prepared: never compiled on the request path
+        _fake_variant(ws.config, 513, 1024, 4, True),
+    )
+    assert ws.variant_for(1).config.max_tokens_per_rank == 128
+    assert ws.variant_for(300).config.max_tokens_per_rank == 512
+    assert ws.variant_for(2048) is ws
+    # Without an EP-uniform maximum a multi-rank workspace keeps the full-capacity kernel.
+    assert ws.select_live_tokens(None, 16) == 8192
+    assert ws.topk_idx.numel() == 1
+    assert ws.select_live_tokens(16, 3) == 128
+    assert ws.topk_idx.numel() == 128
+    assert ws.select_live_tokens(129, 129) == 256
+    assert ws.select_live_tokens(300, 3) == 8192  # its class is not compiled
+    assert ws.select_live_tokens(1024, 16) == 1024
+    assert ws.select_live_tokens(1025, 16) == 8192
+    assert ws.topk_idx.numel() == 1
+    with pytest.raises(ValueError):
+        ws.select_live_tokens(8, 16)  # the maximum must cover this rank
+    ws.config = dataclasses.replace(ws.config, world_size=1)
+    assert ws.select_live_tokens(None, 100) == 128  # one rank: its batch is the maximum
+
+
+def test_device_workspace_data_layout_shares_data_behind_private_state():
+    pytest.importorskip("cutlass")
+    import cutlass
+
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import _paths
+
+    _paths.bootstrap_paths()
+    from sources.helpers.device_workspace import DeviceWorkspace
+
+    def build(rows, layout):
+        ws = DeviceWorkspace()
+        ws.register("flag", cutlass.Int32, (4,), buffer_space="shared", reset="tail_reset")
+        ws.register("signal", cutlass.Int32, (2,), buffer_space="shared", reset="zero_on_first_allocate")
+        ws.register("early", cutlass.Int64, (rows,), buffer_space="shared")
+        ws.register("plane", cutlass.BFloat16, (rows, 8), buffer_space="shared", mem_order=(1, 0))
+        ws.enable_tail_parity("signal")
+        if layout is not None:
+            ws.set_data_layout(*layout)
+        ws.finalize()
+        return ws
+
+    plain = build(64, None)
+    assert plain.offset("early") < plain.offset("plane")  # registration order without a layout
+    state = plain.zero_on_allocate_bytes("shared")
+    slot = -(-state // 128) * 128
+    big = build(64, ((0, 2 * slot), (("plane", 64 * 8 * 2),)))
+    small = build(16, ((0, slot), (("plane", 64 * 8 * 2),)))
+    # Private reset prefixes below each kernel's data offset; one common data address (small binds at +slot).
+    assert big.offset("plane") == 2 * slot and slot + small.offset("plane") == 2 * slot
+    # The leading plane keeps the large kernel's footprint, so other data never overlaps any plane row.
+    assert small.offset("early") == slot + 64 * 8 * 2 and big.offset("early") == 2 * slot + 64 * 8 * 2
+    assert small.zero_on_allocate_bytes("shared") <= slot
+    with pytest.raises(ValueError):
+        build(64, ((0, 0), ()))  # the reset prefix must fit below the data offset

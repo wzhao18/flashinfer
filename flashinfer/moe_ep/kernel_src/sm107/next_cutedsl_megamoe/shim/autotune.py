@@ -457,6 +457,7 @@ def _sweep_sm107_block_scaled_mega_moe(
         # terminate the whole job, then retry a candidate in a fresh job.
         trial = Sm107BlockScaledSymmBuffer(
             trial_cfg,
+            variants=False,  # a trial times one shape
             **({"process_group": process_group} if process_group is not None else {}),
         )
 
