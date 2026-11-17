@@ -26,6 +26,8 @@ import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
 
+from .die_local import localize_weight_pair
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
@@ -350,7 +352,10 @@ def preprocess_block_scaled_weights(
                 scales[expert, offset : offset + swizzled.numel()].copy_(swizzled)
         return data.permute(0, 2, 1), scales.view(sf_dtype)
 
-    return transform(w13, gate_up=True), transform(w2, gate_up=False)
+    return (
+        localize_weight_pair(transform(w13, gate_up=True)),
+        localize_weight_pair(transform(w2, gate_up=False)),
+    )
 
 
 def preprocess_prequantized_block_scaled_weights(
@@ -432,8 +437,9 @@ def preprocess_prequantized_block_scaled_weights(
             data = data.clone()
         return data.view(data_dtype).permute(0, 2, 1), swizzled.view(sf_dtype)
 
-    return transform(w13, w13_scale, gate_up=True), transform(
-        w2, w2_scale, gate_up=False
+    return (
+        localize_weight_pair(transform(w13, w13_scale, gate_up=True)),
+        localize_weight_pair(transform(w2, w2_scale, gate_up=False)),
     )
 
 
@@ -449,7 +455,7 @@ def concatenate_block_scaled_weights(
     scales = torch.cat([sf.view(torch.uint8) for _, sf in parts], dim=0).view(
         parts[0][1].dtype
     )
-    return weights.permute(0, 2, 1), scales
+    return localize_weight_pair((weights.permute(0, 2, 1), scales))
 
 
 def _dequant_activation(
