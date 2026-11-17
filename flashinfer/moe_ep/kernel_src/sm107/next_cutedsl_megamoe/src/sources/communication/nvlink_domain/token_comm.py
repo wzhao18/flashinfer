@@ -133,7 +133,9 @@ class _MetadataPushRouter(KernelComponent):
     src_prefix_by_rank_region = "nvlink.token_comm.src_prefix_by_rank"
     landing_metadata_region = "nvlink.token_comm.landing_metadata"
     landing_scores_region = "nvlink.token_comm.landing_scores"
-    decode_landing_max_routes: ClassVar[int] = 4096
+    # One data CTA covers 16384 routes (_router_launch_configuration), so landing covers every single-CTA capacity
+    # (T * topk <= 16384, i.e. T <= 1024 at topk 16): it removes the push-router round there.
+    decode_landing_max_routes: ClassVar[int] = 16384
     decode_landing_max_world_size: ClassVar[int] = 32
     decode_sizes_poll_sleep_cycles: ClassVar[int] = 200
 
@@ -1378,9 +1380,8 @@ class TokenCommNonDeterministic(KernelComponent):
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
         self.decode_landing = self._router.decode_landing
-        # The landing token_in path lives inside S0's dynamic-claim loop (both gates are T * topk <= 4096).
-        if self.decode_landing and not self.token_in_dynamic_claim:
-            raise AssertionError("decode_landing requires token_in_dynamic_claim.")
+        # Landing (T * topk <= 16384) takes the landing token_in loop with dynamic claim up to 4096 routes and the
+        # static warp stride above (16K pulls over every resident warp: no single-counter contention).
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self.tail_reset_single_cta = False
         self._device_workspace = None
@@ -1954,7 +1955,7 @@ class TokenCommNonDeterministic(KernelComponent):
             thread_idx=lane_idx,
         )
 
-        if cutlass.const_expr(not self.token_in_dynamic_claim):
+        if cutlass.const_expr(not self.token_in_dynamic_claim and not self.decode_landing):
             local_expert = Int32(0)
             while local_expert < Int32(self.experts_per_rank):
                 expert_token_count = owned_sizes[local_expert]
