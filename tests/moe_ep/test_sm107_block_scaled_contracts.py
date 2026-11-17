@@ -859,15 +859,16 @@ def test_variant_classes_dedupe_by_policy_key(kind, world, monkeypatch):
     assert [c.slot for c in classes] == list(range(1, len(classes) + 1))
     for c in classes:
         assert c.config.max_tokens_per_rank == c.hi
-        # Every batch size of a class has the class's compile-time key.
+        # Every batch size of a class has the class's compile-time key and power-of-two capacity bucket.
         key = block_scaled.variant_policy_key(c.config)
         for tokens in {c.lo, (c.lo + c.hi) // 2, c.hi}:
             assert block_scaled.variant_policy_key(_policy_capacity(cfg)(tokens)) == key
-    # Router geometry classes (pow2 route blocks of 2048..16384, landing, dynamic claim) plus N-tile switches:
-    # a handful of kernels serve all 128 vLLM capture sizes.
+            assert (tokens - 1).bit_length() == (c.hi - 1).bit_length()
+    # Power-of-two buckets split further by router geometry, landing, dynamic claim and N-tile switches:
+    # about ten kernels serve all 128 vLLM capture sizes (4..512).
     used = {next(c.hi for c in classes if c.lo <= t <= c.hi) for t in _VLLM_CAPTURE_SIZES}
-    assert 3 <= len(used) <= 5, used
-    assert len(classes) <= 7
+    assert {4, 8, 16, 32, 64, 128, 256} <= used and len(used) <= 11, used
+    assert len(classes) <= 16
 
 
 def test_variant_classes_none_without_eligibility():

@@ -194,7 +194,10 @@ def variant_classes(cfg, config_for_capacity) -> Tuple[_VariantClass, ...]:
     """Policy classes of batch sizes ``1..min(capacity - 1, _VARIANT_MAX_TOKENS)`` of a workspace.
 
     ``config_for_capacity(T)`` is the configuration the workspace would have at capacity ``T``. Consecutive
-    batch sizes with equal :func:`variant_policy_key` form one class, compiled once at its largest size.
+    batch sizes with equal :func:`variant_policy_key` and the same power-of-two capacity bucket form one class,
+    compiled once at its largest size. The bucket bounds what a live batch pays for its kernel's capacity
+    (tail-reset and worst-case extents): measured EP8 NVFP4, T2..T128 on one capacity-128 kernel ran
+    +1.4..+3.2% over a kernel at capacity T; a kernel at most 2x the batch recovers that.
     """
     if not _variant_eligible(cfg):
         return ()
@@ -209,7 +212,7 @@ def variant_classes(cfg, config_for_capacity) -> Tuple[_VariantClass, ...]:
             or any(getattr(vcfg, f) != getattr(cfg, f) for f in same_problem)
         ):
             raise RuntimeError(f"configuration for {tokens} tokens is not a capacity variant of {cfg}")
-        key = variant_policy_key(vcfg)
+        key = (variant_policy_key(vcfg), 1 << (tokens - 1).bit_length())
         if spans and spans[-1][2] == key:
             spans[-1][1] = tokens
             spans[-1][3] = vcfg
