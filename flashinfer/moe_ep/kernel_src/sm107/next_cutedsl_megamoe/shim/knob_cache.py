@@ -601,17 +601,33 @@ def record_knobs(knobs: Dict[str, Any], **kwargs: Any) -> Optional[str]:
     return write_record(make_record(knobs, **kwargs))
 
 
+# Expected routed rows per local expert above which one N256 token block beats
+# two N128 blocks, per activation format (EP8 sm_107, random routing; rows =
+# T x EP x topk / experts).  FP4 activations: 91 rows flat, 110 rows -2.6%,
+# 128 rows -13%, 146 rows -22%.  MXFP8 activations: 91 rows +9%, 110 rows +7%,
+# 128 rows -4%, 146 rows -12%.
+_N256_MIN_ROWS_PER_EXPERT = {256: 100, 128: 120}  # keyed by tile K
+
+
 def default_knobs(
     max_tokens: int,
     *,
     quant_kind: str = "nvfp4",
     kernel_variant: str = "inference",
     combine_dtype: str = "bf16",
+    world_size: Optional[int] = None,
+    topk: Optional[int] = None,
+    num_experts: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Built-in SM107 configurations for cache misses.
 
-    Two token profiles (see TUNING.md): <2048 tokens/rank keeps the 128-wide
-    N tile, >=2048 the 256-wide.  Both use mixed CGA (4x1 preferred, 2x1
+    The N tile follows the expected routed rows per local expert,
+    ``max_tokens * world_size * topk / num_experts``: N256 once that exceeds
+    one 128-row token block (one block per expert instead of two, so each
+    expert's weights are streamed once; the crossover is ~100 rows for FP4
+    activations and ~120 for MXFP8), else N128; >=2048 tokens/rank is
+    always N256.  Without the routing geometry only the token-count rule
+    applies.  See TUNING.md.  All profiles use mixed CGA (4x1 preferred, 2x1
     fallback), phase-interleave with the kernel-resolved minimum hint, atomic
     work IDs, FC2 bulk TMA stage 2, epi-warp token back, and separate top-k
     reduction.  Tile K is the kind's 2x-mode depth (2 x instruction K).
@@ -632,6 +648,10 @@ def default_knobs(
         raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
     tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     tile_n = 128 if max_tokens < 2048 else 256
+    if world_size and topk and num_experts:
+        rows_per_expert = max_tokens * world_size * topk / num_experts
+        if rows_per_expert > _N256_MIN_ROWS_PER_EXPERT[tile_k]:
+            tile_n = 256
     knobs = {
         "mma_tiler_mnk": (256, tile_n, tile_k),
         "cluster_shape_mn": (4, 1),
@@ -725,6 +745,9 @@ def resolve_knobs(
         quant_kind=dtype,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
+        world_size=world_size,
+        topk=topk,
+        num_experts=num_experts,
     ), "heuristic"
 
 
