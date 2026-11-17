@@ -96,6 +96,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
+            "die_split": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -611,6 +612,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        sm_locality_domain: Optional[cute.Tensor] = None,  # (1024,) uint8 die of each %smid (die_split only)
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -803,6 +805,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.epilogue.prepare_tma_store_params(fc1_output_gemm, fc2_output)
         )
 
+        if cutlass.const_expr(getattr(self.scheduler, "die_split", False) and sm_locality_domain is None):
+            raise ValueError("die_split scheduling needs the sm_locality_domain map.")
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
         kernel = self._kernel(
@@ -840,6 +844,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            sm_locality_domain,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -905,6 +910,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        sm_locality_domain: Optional[cute.Tensor],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -1015,9 +1021,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("scheduler.register_group")
                 scheduler.initialize_fallback_group()
                 iket.range_pop()
+            die_split = getattr(scheduler, "die_split", False)
+            if cutlass.const_expr(die_split):
+                scheduler.probe_die(sm_locality_domain)
             iket.range_push("scheduler.wait_sizes_ready")
             self.token_comm.wait_for_sizes_ready(self._device_workspace)
             iket.range_pop()
+            if cutlass.const_expr(die_split):
+                scheduler.prepare_streams()
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()

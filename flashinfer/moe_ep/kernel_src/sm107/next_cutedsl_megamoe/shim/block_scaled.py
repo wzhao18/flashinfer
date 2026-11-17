@@ -832,6 +832,14 @@ class Sm107BlockScaledSymmBuffer:
         }
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
+        if cfg.kernel_variant != "genphase" and cfg.schedule_policy[0] == "phase_interleave":
+            # Multi-die GPU: the weight preprocessing places the lower half of the local experts on locality
+            # domain 0 and the upper half on domain 1 (die_local.py); the scheduler then lets each die claim
+            # from its own end of the expert-ordered work streams.
+            from .die_local import locality_domain_count
+
+            if locality_domain_count(torch.cuda.current_device()) >= 2:
+                impl_fields["die_split"] = True
         if cfg.fallback_cluster_shape_mn is not None:
             impl_fields["fallback_cluster_shape_mn"] = tuple(
                 cfg.fallback_cluster_shape_mn
@@ -919,7 +927,21 @@ class Sm107BlockScaledSymmBuffer:
                 for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             },
+            **(
+                {"sm_locality_domain": _to_cute(self._sm_locality_domain())}
+                if getattr(self.kernel.scheduler, "die_split", False)
+                else {}
+            ),
         }
+
+    def _sm_locality_domain(self) -> torch.Tensor:
+        """Die of every SM (``die_local.sm_locality_domain_map``), for the die_split scheduler."""
+        from .die_local import SM_LOCALITY_MAP_SIZE, sm_locality_domain_map
+
+        domains = sm_locality_domain_map(self.device.index)
+        if domains.numel() != SM_LOCALITY_MAP_SIZE:
+            raise RuntimeError("unexpected SM locality map size")
+        return domains
 
     def prepare(
         self,

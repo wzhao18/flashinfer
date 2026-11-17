@@ -30,6 +30,7 @@ from ...helpers.ptx_helpers import (
     stg_b64,
     stg_f32,
     tma_load_1d,
+    two_ended_claim_u64,
 )
 from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
@@ -1347,6 +1348,7 @@ class TokenCommNonDeterministic(KernelComponent):
             "token_back_schedule_mode": str,
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
+            "die_split": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1374,6 +1376,10 @@ class TokenCommNonDeterministic(KernelComponent):
         )
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
+        # die_split (die-local expert weights): the die-0 clusters compute from the lowest expert up and the die-1
+        # clusters from the highest expert down, so token_in pulls from both ends too (even transfer warps from the
+        # bottom, odd ones from the top) and each end's tokens arrive in the order that end consumes them.
+        self.die_split = impl_desc.get("die_split", False)
 
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
@@ -1692,7 +1698,11 @@ class TokenCommNonDeterministic(KernelComponent):
             )
         if self.token_in_dynamic_claim:
             workspace.register(
-                self.token_in_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
+                self.token_in_schedule_region,
+                cutlass.Int64 if self.die_split else cutlass.Int32,
+                (1,),
+                buffer_space="local",
+                reset="tail_reset",
             )
 
         if not self.reduce_topk_in_kernel:
@@ -1939,12 +1949,39 @@ class TokenCommNonDeterministic(KernelComponent):
         source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
         sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
 
+        # die_split: odd transfer warps walk the experts downward from the top end (see __init__).
+        from_top = Int32(0)
+        end_token_count = Int32(0)
+        end_sf_rows = Int32(0)
+        end_ready_slots = Int32(0)
+        end_pool_rows = Int32(0)
+        bottom_split = Int32(0)
+        static_stride = global_warp_count
         next_dense_token = global_warp_idx
-        if cutlass.const_expr(self.token_in_dynamic_claim):
-            next_dense_token = self.claim_token_in()
         expert_valid_begin = Int32(0)
         expert_sf_begin = Int32(0)
         expert_ready_slot_begin = Int32(0)
+        start_expert = Int32(0)
+        if cutlass.const_expr(self.die_split):
+            from_top = global_warp_idx & Int32(1)
+            end_token_count, end_sf_rows, end_ready_slots, end_pool_rows = self._owned_size_totals(owned_sizes)
+            # Static schedule: even warps own dense tokens [0, bottom_split) ascending, odd warps [bottom_split, N)
+            # descending.
+            bottom_warps = (global_warp_count + Int32(1)) // Int32(2)
+            bottom_split = (end_token_count * bottom_warps + global_warp_count - Int32(1)) // global_warp_count
+            static_stride = bottom_warps
+            next_dense_token = global_warp_idx // Int32(2)
+            if from_top != Int32(0):
+                static_stride = global_warp_count - bottom_warps
+                next_dense_token = end_token_count - Int32(1) - global_warp_idx // Int32(2)
+                # Begins of the last expert: totals minus its own padded extents.
+                last_count = owned_sizes[Int32(self.experts_per_rank - 1)]
+                start_expert = Int32(self.experts_per_rank - 1)
+                expert_valid_begin = end_token_count - last_count
+                expert_sf_begin = end_sf_rows - self._padded(last_count, self.sf_padding_block)
+                expert_ready_slot_begin = end_ready_slots - self._slots(last_count)
+        if cutlass.const_expr(self.token_in_dynamic_claim):
+            next_dense_token = self.claim_token_in(from_top, end_token_count)
         pull_phase = Int32(0)
         flag_tracker = make_flag_batch_tracker(
             use_async=self.token_in_flag_batch == 1,
@@ -1955,16 +1992,32 @@ class TokenCommNonDeterministic(KernelComponent):
         )
 
         if cutlass.const_expr(not self.token_in_dynamic_claim):
-            local_expert = Int32(0)
-            while local_expert < Int32(self.experts_per_rank):
+            local_expert = start_expert
+            while (local_expert < Int32(self.experts_per_rank)) & (local_expert >= Int32(0)):
                 expert_token_count = owned_sizes[local_expert]
                 expert_valid_end = expert_valid_begin + expert_token_count
                 pull_count = Int32(0)
-                if next_dense_token < expert_valid_end:
-                    pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
+                if cutlass.const_expr(not self.die_split):
+                    if next_dense_token < expert_valid_end:
+                        pull_count = (
+                            expert_valid_end - next_dense_token + global_warp_count - Int32(1)
+                        ) // global_warp_count
+                else:
+                    if from_top == Int32(0):
+                        bottom_end = cutlass.min(expert_valid_end, bottom_split)
+                        if next_dense_token < bottom_end:
+                            pull_count = (bottom_end - next_dense_token + static_stride - Int32(1)) // static_stride
+                    else:
+                        top_begin = cutlass.max(expert_valid_begin, bottom_split)
+                        if (next_dense_token >= top_begin) & (next_dense_token < expert_valid_end):
+                            pull_count = (next_dense_token - top_begin) // static_stride + Int32(1)
 
                 for pull_round in cutlass.range(pull_count, unroll=1):
                     dense_token_idx = next_dense_token + Int32(pull_round) * global_warp_count
+                    if cutlass.const_expr(self.die_split):
+                        dense_token_idx = next_dense_token + Int32(pull_round) * static_stride
+                        if from_top != Int32(0):
+                            dense_token_idx = next_dense_token - Int32(pull_round) * static_stride
                     token_in_expert = dense_token_idx - expert_valid_begin
                     pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                     sf_token_idx = expert_sf_begin + token_in_expert
@@ -2038,24 +2091,50 @@ class TokenCommNonDeterministic(KernelComponent):
                     cute.arch.sync_warp()
                     pull_phase = pull_phase ^ Int32(1)
 
-                next_dense_token = next_dense_token + pull_count * global_warp_count
-                expert_valid_begin = expert_valid_end
-                expert_sf_begin = expert_sf_begin + (
-                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
-                ) * Int32(self.sf_padding_block)
-                expert_ready_slot_begin = expert_ready_slot_begin + (
-                    (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
-                    // Int32(self.tokens_per_fc1_ready_slot)
-                )
-                local_expert = local_expert + Int32(1)
+                if cutlass.const_expr(not self.die_split):
+                    next_dense_token = next_dense_token + pull_count * global_warp_count
+                    expert_valid_begin = expert_valid_end
+                    expert_sf_begin = expert_sf_begin + (
+                        (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                    ) * Int32(self.sf_padding_block)
+                    expert_ready_slot_begin = expert_ready_slot_begin + (
+                        (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                        // Int32(self.tokens_per_fc1_ready_slot)
+                    )
+                    local_expert = local_expert + Int32(1)
+                else:
+                    if from_top == Int32(0):
+                        next_dense_token = next_dense_token + pull_count * static_stride
+                        expert_valid_begin = expert_valid_end
+                        expert_sf_begin = expert_sf_begin + self._padded(expert_token_count, self.sf_padding_block)
+                        expert_ready_slot_begin = expert_ready_slot_begin + self._slots(expert_token_count)
+                        local_expert = local_expert + Int32(1)
+                    else:
+                        next_dense_token = next_dense_token - pull_count * static_stride
+                        local_expert = local_expert - Int32(1)
+                        if local_expert >= Int32(0):
+                            previous_count = owned_sizes[local_expert]
+                            expert_valid_begin = expert_valid_begin - previous_count
+                            expert_sf_begin = expert_sf_begin - self._padded(previous_count, self.sf_padding_block)
+                            expert_ready_slot_begin = expert_ready_slot_begin - self._slots(previous_count)
+                    # This warp's half is done: skip walking the remaining experts.
+                    if (from_top == Int32(0)) & (next_dense_token >= bottom_split):
+                        local_expert = Int32(self.experts_per_rank)
+                    if (from_top != Int32(0)) & (next_dense_token < bottom_split):
+                        local_expert = Int32(-1)
         else:
             # Decode landing state (loop-carried in this branch only).
             expert_pool_begin = Int32(0)
+            if cutlass.const_expr(self.die_split and self.decode_landing):
+                if from_top != Int32(0):
+                    expert_pool_begin = end_pool_rows - self._padded(
+                        owned_sizes[Int32(self.experts_per_rank - 1)], self.token_padding_block
+                    )
             lane_source_size = Int32(0)
             lane_landing_base = Int32(0)
             lane_ring_end = Int32(0)
-            local_expert = Int32(0)
-            while local_expert < Int32(self.experts_per_rank):
+            local_expert = start_expert
+            while (local_expert < Int32(self.experts_per_rank)) & (local_expert >= Int32(0)):
                 expert_token_count = owned_sizes[local_expert]
                 expert_valid_end = expert_valid_begin + expert_token_count
                 pull_count = Int32(0)
@@ -2064,8 +2143,12 @@ class TokenCommNonDeterministic(KernelComponent):
                         pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
                 else:
                     # Dynamic claim: one pull per loop trip while the claimed token lies in this expert.
-                    if next_dense_token < expert_valid_end:
-                        pull_count = Int32(1)
+                    if cutlass.const_expr(not self.die_split):
+                        if next_dense_token < expert_valid_end:
+                            pull_count = Int32(1)
+                    else:
+                        if (next_dense_token >= expert_valid_begin) & (next_dense_token < expert_valid_end):
+                            pull_count = Int32(1)
                 if cutlass.const_expr(self.decode_landing):
                     if pull_count > Int32(0):
                         # Ring table of this expert, once per expert visit with work: lane l <-> source (rank + l) % W.
@@ -2139,7 +2222,8 @@ class TokenCommNonDeterministic(KernelComponent):
                     cute.arch.sync_warp()
                     upcoming_token = next_dense_token
                     if cutlass.const_expr(self.token_in_dynamic_claim):
-                        upcoming_token = self.claim_token_in()  # overlaps the payload transfer
+                        # overlaps the payload transfer
+                        upcoming_token = self.claim_token_in(from_top, end_token_count)
                     cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
 
                     destination_activation = cute.make_ptr(
@@ -2176,28 +2260,58 @@ class TokenCommNonDeterministic(KernelComponent):
                     if cutlass.const_expr(self.token_in_dynamic_claim):
                         next_dense_token = upcoming_token
                         pull_count = Int32(0)
-                        if next_dense_token < expert_valid_end:
-                            pull_count = Int32(1)
+                        if cutlass.const_expr(not self.die_split):
+                            if next_dense_token < expert_valid_end:
+                                pull_count = Int32(1)
+                        else:
+                            if (next_dense_token >= expert_valid_begin) & (next_dense_token < expert_valid_end):
+                                pull_count = Int32(1)
                         pull_round = Int32(0)
                     else:
                         pull_round = pull_round + Int32(1)
 
                 if cutlass.const_expr(not self.token_in_dynamic_claim):
                     next_dense_token = next_dense_token + pull_count * global_warp_count
-                if cutlass.const_expr(self.decode_landing):
-                    # == pool_expert_base[local_expert + 1] of _compute_push_tables (padded prefix of owned sizes).
-                    expert_pool_begin = expert_pool_begin + (
-                        (expert_token_count + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
-                    ) * Int32(self.token_padding_block)
-                expert_valid_begin = expert_valid_end
-                expert_sf_begin = expert_sf_begin + (
-                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
-                ) * Int32(self.sf_padding_block)
-                expert_ready_slot_begin = expert_ready_slot_begin + (
-                    (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
-                    // Int32(self.tokens_per_fc1_ready_slot)
-                )
-                local_expert = local_expert + Int32(1)
+                if cutlass.const_expr(not self.die_split):
+                    if cutlass.const_expr(self.decode_landing):
+                        # == pool_expert_base[local_expert + 1] of _compute_push_tables (padded prefix of owned sizes).
+                        expert_pool_begin = expert_pool_begin + (
+                            (expert_token_count + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
+                        ) * Int32(self.token_padding_block)
+                    expert_valid_begin = expert_valid_end
+                    expert_sf_begin = expert_sf_begin + (
+                        (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                    ) * Int32(self.sf_padding_block)
+                    expert_ready_slot_begin = expert_ready_slot_begin + (
+                        (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                        // Int32(self.tokens_per_fc1_ready_slot)
+                    )
+                    local_expert = local_expert + Int32(1)
+                else:
+                    if from_top == Int32(0):
+                        if cutlass.const_expr(self.decode_landing):
+                            expert_pool_begin = expert_pool_begin + self._padded(
+                                expert_token_count, self.token_padding_block
+                            )
+                        expert_valid_begin = expert_valid_end
+                        expert_sf_begin = expert_sf_begin + self._padded(expert_token_count, self.sf_padding_block)
+                        expert_ready_slot_begin = expert_ready_slot_begin + self._slots(expert_token_count)
+                        local_expert = local_expert + Int32(1)
+                    else:
+                        local_expert = local_expert - Int32(1)
+                        if local_expert >= Int32(0):
+                            previous_count = owned_sizes[local_expert]
+                            if cutlass.const_expr(self.decode_landing):
+                                expert_pool_begin = expert_pool_begin - self._padded(
+                                    previous_count, self.token_padding_block
+                                )
+                            expert_valid_begin = expert_valid_begin - previous_count
+                            expert_sf_begin = expert_sf_begin - self._padded(previous_count, self.sf_padding_block)
+                            expert_ready_slot_begin = expert_ready_slot_begin - self._slots(previous_count)
+                    if cutlass.const_expr(self.token_in_dynamic_claim):
+                        # Exhausted two-ended claim: skip walking the remaining experts.
+                        if next_dense_token == Int32(0x7FFFFFFF):
+                            local_expert = Int32(-1)
 
         flag_tracker.fire()
         cute.arch.sync_warp()
@@ -2710,13 +2824,48 @@ class TokenCommNonDeterministic(KernelComponent):
         return metadata
 
     @cute.jit
-    def claim_token_in(self) -> Int32:
-        """Warp-uniform dense token index claimed from the token_in schedule counter."""
+    def claim_token_in(self, from_top=None, token_count=None) -> Int32:
+        """Warp-uniform dense token index claimed from the token_in schedule counter.
+
+        die_split: the counter is two-ended over [0, token_count) (``two_ended_claim_u64``); a warp claims from the
+        top when ``from_top`` is nonzero, and an exhausted stream returns 0x7FFFFFFF (outside every expert).
+        """
         counter = self._device_workspace.ptr(self.token_in_schedule_region)
         claimed = Int32(0)
         if self._lane_idx == Int32(0):
-            claimed = cute.arch.atomic_add(counter, Int32(1), sem="relaxed", scope="gpu")
+            if cutlass.const_expr(self.die_split):
+                claimed = two_ended_claim_u64(counter, from_top, token_count)
+            else:
+                claimed = cute.arch.atomic_add(counter, Int32(1), sem="relaxed", scope="gpu")
         return Int32(cute.arch.shuffle_sync(claimed, Int32(0)))
+
+    def _padded(self, count: Int32, block: int) -> Int32:
+        return (count + Int32(block - 1)) // Int32(block) * Int32(block)
+
+    def _slots(self, count: Int32) -> Int32:
+        return (count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(self.tokens_per_fc1_ready_slot)
+
+    @cute.jit
+    def _owned_size_totals(self, owned_sizes: cute.Tensor) -> Tuple[Int32, Int32, Int32, Int32]:
+        """Warp-cooperative totals over this rank's experts: tokens, padded SF rows, FC1 ready slots, pool rows."""
+        lane_idx = self._lane_idx
+        tokens = Int32(0)
+        sf_rows = Int32(0)
+        slots = Int32(0)
+        pool_rows = Int32(0)
+        for batch_base in cutlass.range_constexpr(0, self.experts_per_rank, 32):
+            expert = Int32(batch_base) + lane_idx
+            if expert < Int32(self.experts_per_rank):
+                count = owned_sizes[expert]
+                tokens = tokens + count
+                sf_rows = sf_rows + self._padded(count, self.sf_padding_block)
+                slots = slots + self._slots(count)
+                pool_rows = pool_rows + self._padded(count, self.token_padding_block)
+        tokens = Int32(cute.arch.shuffle_sync(_warp_inclusive_sum(tokens, lane_idx), Int32(31)))
+        sf_rows = Int32(cute.arch.shuffle_sync(_warp_inclusive_sum(sf_rows, lane_idx), Int32(31)))
+        slots = Int32(cute.arch.shuffle_sync(_warp_inclusive_sum(slots, lane_idx), Int32(31)))
+        pool_rows = Int32(cute.arch.shuffle_sync(_warp_inclusive_sum(pool_rows, lane_idx), Int32(31)))
+        return tokens, sf_rows, slots, pool_rows
 
     @cute.jit
     def next_token(self, current_token: Int32) -> Int32:
