@@ -95,6 +95,10 @@ class DeviceWorkspace:
         self._zero_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
         self._tail_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
         self._base: Dict[BufferSpace, Any] = {"local": None, "shared": None}
+        # Parity double buffering of the tail-reset prefix (see enable_tail_parity).
+        self._tail_parity_region: Optional[str] = None
+        self._tail_copy_bytes: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
+        self._tail_parity = None
         self._finalized = False
 
     def __extract_mlir_values__(self) -> list:
@@ -138,9 +142,42 @@ class DeviceWorkspace:
             )
         )
 
+    def enable_tail_parity(self, parity_region: str) -> None:
+        """Double-buffer every ``tail_reset`` region by call parity.
+
+        Call ``c`` uses copy ``parity(c)`` and clears copy ``1 - parity(c)``, which
+        nobody reads or writes until call ``c + 1``. The parity is bit 0 of the
+        ``Int32`` region ``parity_region`` (a counter advanced once per call, and
+        never itself ``tail_reset``), loaded once when device members are assigned
+        with ``load_tail_parity=True``. A tail-reset region pointer requested
+        without a loaded parity is a trace-time error.
+        """
+        if self._finalized:
+            raise RuntimeError("enable_tail_parity() must precede finalize().")
+        self._tail_parity_region = parity_region
+
+    @property
+    def tail_parity_enabled(self) -> bool:
+        return self._tail_parity_region is not None
+
     def finalize(self) -> None:
         if self._finalized:
             raise RuntimeError("DeviceWorkspace.finalize() may only be called once.")
+        if self._tail_parity_region is not None:
+            parity_region = self._region_by_name.get(self._tail_parity_region) or next(
+                (
+                    region
+                    for regions in self._registered.values()
+                    for region in regions
+                    if region.name == self._tail_parity_region
+                ),
+                None,
+            )
+            if parity_region is None or parity_region.reset == "tail_reset" or parity_region.dtype.width != 32:
+                raise ValueError(
+                    f"Tail parity region {self._tail_parity_region!r} must be a registered, "
+                    "non-tail-reset Int32 region."
+                )
         for buffer_space in ("local", "shared"):
             ordered = sorted(self._registered[buffer_space], key=lambda region: _reset_order[region.reset])
             cursor = 0
@@ -168,10 +205,18 @@ class DeviceWorkspace:
                 )
                 if is_last_tail_reset_region:
                     cursor = round_up(cursor, 16)
+                    self._tail_leading[buffer_space] = cursor
+                    if self._tail_parity_region is not None:
+                        # Second copy right behind the first; its stride keeps every
+                        # tail region's alignment.
+                        copy_alignment = max(
+                            [16] + [r.byte_alignment for r in ordered if r.reset == "tail_reset"]
+                        )
+                        copy_bytes = round_up(cursor, copy_alignment)
+                        self._tail_copy_bytes[buffer_space] = copy_bytes
+                        cursor = copy_bytes * 2
                 if region.reset != "data":
                     self._zero_leading[buffer_space] = cursor
-                if is_last_tail_reset_region:
-                    self._tail_leading[buffer_space] = cursor
             self._total[buffer_space] = round_up(cursor, 16)
         self._finalized = True
 
@@ -226,19 +271,40 @@ class DeviceWorkspace:
 
     @cute.jit
     def assign_device_members(
-        self, local_workspace: cute.Pointer, shared_workspace: Optional[cute.Pointer] = None
+        self,
+        local_workspace: cute.Pointer,
+        shared_workspace: Optional[cute.Pointer] = None,
+        *,
+        load_tail_parity: bool = False,
     ) -> None:
+        """Bind the workspace bases; device code passes load_tail_parity=True."""
         self._base["local"] = local_workspace
         self._base["shared"] = shared_workspace
+        self._tail_parity = None
+        if cutlass.const_expr(load_tail_parity and self._tail_parity_region is not None):
+            counter = cute.arch.load(self.ptr(self._tail_parity_region), Int32, sem="relaxed", scope="gpu")
+            self._tail_parity = counter & Int32(1)
 
     def remove_device_members(self) -> None:
         self._base = {"local": None, "shared": None}
+        self._tail_parity = None
+
+    @cute.jit
+    def _tail_copy_offset(self, buffer_space: BufferSpace, copy_select) -> Int64:
+        return Int64(copy_select) * Int64(self._tail_copy_bytes[buffer_space])
 
     @cute.jit
     def ptr(self, name: str) -> cute.Pointer:
         region = self._region_by_name[name]
         base = self._base[region.buffer_space]
         address = base.toint() + Int64(self._offset[name])
+        if cutlass.const_expr(self._tail_parity_region is not None and region.reset == "tail_reset"):
+            if cutlass.const_expr(self._tail_parity is None):
+                raise RuntimeError(
+                    f"Tail-reset region {name!r} needs the call parity: assign device members with "
+                    "load_tail_parity=True in device code."
+                )
+            address = address + self._tail_copy_offset(region.buffer_space, self._tail_parity)
         return cute.make_ptr(region.dtype, address, AddressSpace.gmem, assumed_align=self._byte_alignment[name])
 
     @cute.jit
@@ -253,10 +319,16 @@ class DeviceWorkspace:
 
     @cute.jit
     def reset_tail_space(self, buffer_space: BufferSpace, tid: Int32, total_threads: int) -> None:
+        """Clear the tail-reset prefix; with tail parity, the copy the next call uses."""
         num_vectors = self._tail_leading[buffer_space] // 16
         if cutlass.const_expr(num_vectors > 0):
+            reset_base = self._base[buffer_space].toint()
+            if cutlass.const_expr(self._tail_parity_region is not None):
+                if cutlass.const_expr(self._tail_parity is None):
+                    raise RuntimeError("reset_tail_space needs the call parity (load_tail_parity=True).")
+                reset_base = reset_base + self._tail_copy_offset(buffer_space, Int32(1) - self._tail_parity)
             vectors = cute.make_tensor(
-                cute.make_ptr(Int32, self._base[buffer_space].toint(), AddressSpace.gmem, assumed_align=16),
+                cute.make_ptr(Int32, reset_base, AddressSpace.gmem, assumed_align=16),
                 cute.make_layout((num_vectors, 4), stride=(4, 1)),
             )
             zero = cute.make_rmem_tensor((4,), Int32)
