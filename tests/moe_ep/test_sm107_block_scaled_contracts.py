@@ -955,3 +955,301 @@ def test_device_workspace_data_layout_shares_data_behind_private_state():
     assert small.zero_on_allocate_bytes("shared") <= slot
     with pytest.raises(ValueError):
         build(64, ((0, 0), ()))  # the reset prefix must fit below the data offset
+
+
+# ---- Batch-size variant plan, launch bindings and EP agreement (CPU: fake kernels, no cutlass) ----
+
+
+class _FakeDeviceWorkspace:
+    """Region layout of a built kernel: reset prefix, then (with a data layout) the leading planes at the data
+    offset followed by this kernel's own data, sized by its capacity."""
+
+    def __init__(self, cfg, data_layout):
+        rows = cfg.max_tokens_per_rank
+        self.reset = {"local": 40 + rows % 5, "shared": 300 + 2 * rows}
+        own_planes = (("plane", rows * 64), ("plane_sf", rows * 4))
+        if data_layout is None:
+            self.data_start, planes = (self.reset["local"], self.reset["shared"]), own_planes
+        else:
+            self.data_start, planes = data_layout
+        self._region_by_name = dict.fromkeys(("plane", "plane_sf", "early", "scratch"))
+        self._offsets, self._nbytes, at = {}, {}, self.data_start[1]
+        for name, nbytes in (*planes, ("early", rows * 16)):
+            self._offsets[name], self._nbytes[name] = at, nbytes
+            at += nbytes
+        self._total = {"local": self.data_start[0] + rows * 8, "shared": at}
+
+    def zero_on_allocate_bytes(self, space):
+        return self.reset[space]
+
+    def offset(self, name):
+        return self._offsets[name]
+
+    def nbytes(self, name):
+        return self._nbytes[name]
+
+    def total_bytes(self, space):
+        return self._total[space]
+
+
+def _fake_build(cfg, data_layout=None):
+    return SimpleNamespace(
+        config=cfg,
+        _device_workspace=_FakeDeviceWorkspace(cfg, data_layout),
+        token_comm=SimpleNamespace(
+            pre_reduced_activation_region="plane", pre_reduced_activation_sf_region="plane_sf"
+        ),
+    )
+
+
+def _fake_policy_key(cfg):
+    # Landing below 8 tokens, N-tile switch at 24: a non-power-of-two policy split.
+    tokens = cfg.max_tokens_per_rank
+    return (tokens <= 8, cfg.mma_tiler_mnk if tokens <= 24 else "wide")
+
+
+@pytest.fixture
+def fake_variant_kernels(monkeypatch):
+    monkeypatch.setattr(block_scaled, "variant_policy_key", _fake_policy_key)
+    monkeypatch.setattr(block_scaled, "_check_policy_key", lambda key, kernel: None)
+    monkeypatch.setattr(Sm107BlockScaledSymmBuffer, "_build_kernel", staticmethod(_fake_build))
+    monkeypatch.setattr(block_scaled, "_VARIANT_MAX_TOKENS", 64)
+
+
+def _capacity_fn(cfg, **per_capacity):
+    def config_for_capacity(tokens):
+        knobs = {k: f(tokens) for k, f in per_capacity.items()}
+        return dataclasses.replace(cfg, max_tokens_per_rank=tokens, **knobs)
+
+    return config_for_capacity
+
+
+def test_plan_variants_layout_private_slots_shared_data(fake_variant_kernels):
+    cfg = _kimi_config(max_tokens_per_rank=256)
+    plan = block_scaled._plan_variants(cfg, _capacity_fn(cfg))
+    # Classes 1..64 split by power-of-two bucket and the fake policy (8, 24).
+    assert [(c.lo, c.hi) for c in plan.classes] == [
+        (1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 24), (25, 32), (33, 64)
+    ]
+    assert plan.slots == len(plan.classes) + 1
+    kernels = plan.kernels
+    configs = [cfg] + [c.config for c in plan.classes]
+    assert [k.config for k in kernels] == configs
+    for space, i in (("local", 0), ("shared", 1)):
+        slot_bytes = plan.slot_bytes[i]
+        assert slot_bytes % 128 == 0
+        data = plan.slots * slot_bytes
+        for slot, kernel in enumerate(kernels):
+            ws = kernel._device_workspace
+            # Private reset prefix inside its own slot: [slot * slot_bytes, +reset) never reaches the next slot.
+            assert ws.zero_on_allocate_bytes(space) <= slot_bytes
+            # Every kernel's data region starts at one common absolute address behind all slots.
+            assert slot * slot_bytes + ws.data_start[i] == data
+            assert slot * slot_bytes + ws.total_bytes(space) <= plan.total_bytes[i]
+        assert plan.total_bytes[i] == max(
+            s * slot_bytes + k._device_workspace.total_bytes(space) for s, k in enumerate(kernels)
+        )
+    # The combine planes lead every kernel at the CAPACITY kernel's size, so no kernel's peer-written data
+    # (early) overlaps any plane row the separate reduction reads after a kernel.
+    capacity_planes = (("plane", 256 * 64), ("plane_sf", 256 * 4))
+    assert plan.leading == capacity_planes
+    data = plan.slots * plan.slot_bytes[1]
+    plane_end = data + sum(n for _, n in capacity_planes)
+    for slot, kernel in enumerate(kernels):
+        base = slot * plan.slot_bytes[1]
+        assert base + kernel._device_workspace.offset("plane") == data
+        assert base + kernel._device_workspace.offset("early") >= plane_end
+
+
+def test_variant_classes_skip_non_variant_capacities(fake_variant_kernels):
+    cfg = _kimi_config(max_tokens_per_rank=256)
+    # A tuned cache entry picks the in-kernel reduction for 3..6 tokens: those batch sizes have no class and
+    # run on the capacity kernel; the classes around them stay contiguous.
+    cfc = _capacity_fn(cfg, reduce_topk_in_kernel=lambda t: 3 <= t <= 6)
+    classes = block_scaled.variant_classes(cfg, cfc)
+    assert [(c.lo, c.hi) for c in classes][:4] == [(1, 1), (2, 2), (7, 8), (9, 16)]
+    assert [c.slot for c in classes] == list(range(1, len(classes) + 1))
+    assert all(not c.config.reduce_topk_in_kernel for c in classes)
+    ws = object.__new__(Sm107BlockScaledSymmBuffer)
+    ws.config = cfg
+    ws._variants = tuple(_fake_variant(cfg, c.lo, c.hi, c.slot, True) for c in classes)
+    assert ws.variant_for(2).config.max_tokens_per_rank == 2
+    assert all(ws.variant_for(t) is ws for t in range(3, 7))
+    assert ws.variant_for(7).config.max_tokens_per_rank == 8
+    # A configuration of another problem is still a misuse.
+    with pytest.raises(RuntimeError, match="not a capacity variant"):
+        block_scaled.variant_classes(cfg, _capacity_fn(cfg, hidden=lambda t: 7168))
+
+
+@pytest.fixture
+def fake_cute(monkeypatch):
+    """``import cutlass.cute`` in ``_prepare_self`` without the DSL: compile returns a mock kernel."""
+    cute = SimpleNamespace(compile=mock.Mock(side_effect=lambda kernel, **kw: mock.Mock()))
+    monkeypatch.setitem(sys.modules, "cutlass", SimpleNamespace(cute=cute))
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=11))
+    return cute
+
+
+def _output_workspace():
+    ws = _workspace()
+    ws._output_binds = 0
+
+    def output_kwarg(out):  # not a Mock: call records would keep every output alive
+        ws._output_binds += 1
+        return ("caller output", out.data_ptr())
+
+    ws._output_kwarg = output_kwarg
+    return ws
+
+
+def test_kwargs_cache_does_not_retain_caller_outputs(fake_cute):
+    import gc
+    import weakref
+
+    ws = _output_workspace()
+    weights = (torch.empty(4), torch.empty(4))
+    refs = []
+    for _ in range(8):  # vLLM eager steps: a fresh output per MoE call
+        y = torch.empty(3, 128, dtype=torch.bfloat16)
+        refs.append(weakref.ref(y))
+        ws.prepare(weights, weights, output=y[:2], live_tokens=2)
+        assert ws._launch_kwargs["output_activation"] == ("caller output", y.data_ptr())
+        del y
+    gc.collect()
+    # Only the latest output stays bound (as before the kwargs cache existed).
+    assert [r() is not None for r in refs] == [False] * 7 + [True]
+    # Workspace bindings are built once per (weights, stream, live rows); outputs bind per change.
+    assert ws._runtime_kwargs.call_count == 1
+    assert ws._output_binds == 8
+    # Own output: the cached binding itself, and the last caller output is released.
+    ws.prepare(weights, weights, live_tokens=2)
+    assert ws._runtime_kwargs.call_count == 1 and ws._output_binds == 8
+    assert ws._launch_kwargs is next(iter(ws._kwargs_cache.values()))[0]
+    gc.collect()
+    assert refs[-1]() is None
+
+
+def test_kwargs_cache_cleared_when_execution_state_is_released(fake_cute):
+    ws = _output_workspace()
+    ws._compiled = None
+    weights = (torch.empty(4), torch.empty(4))
+    ws.prepare(weights, weights, live_tokens=2)
+    assert ws._kwargs_cache and ws._runtime_kwargs.call_count == 1
+    with mock.patch.object(comm, "free_sym_tensor"):
+        ws._release_execution_state()  # install_tuned_knobs: frees the workspaces the bindings name
+    assert "_kwargs_cache" not in ws.__dict__
+    ws._compiled = None  # reallocated: the next prepare compiles against fresh bindings, same key
+    ws.prepare(weights, weights, live_tokens=2)
+    assert ws._runtime_kwargs.call_count == 2
+    assert fake_cute.compile.call_count == 2
+
+
+def _aligned_bytes(n):
+    buf = torch.zeros(n + 128, dtype=torch.uint8)
+    off = (-buf.data_ptr()) % 128
+    return buf[off : off + n]
+
+
+def test_kwargs_cache_cleared_when_workspaces_are_rebound():
+    ws = object.__new__(Sm107BlockScaledSymmBuffer)
+    ws.config = _config()
+    tokens, topk = ws.config.padded_tokens_per_rank, ws.config.num_topk
+    region = SimpleNamespace(offset=lambda name: 0, nbytes=lambda name: tokens * topk * 2)
+    ws.kernel = SimpleNamespace(
+        _device_workspace=region,
+        token_comm=SimpleNamespace(pre_reduced_activation_region="plane"),
+    )
+    ws.local_workspace = _aligned_bytes(256)
+    ws.shared_workspace = _aligned_bytes(tokens * topk * 2)
+    ws._kwargs_cache = {"old": ({"shared_workspace": "old"}, None)}
+    ws._bind_execution_state(peers_of=SimpleNamespace(_symmetric_base=1 << 20, _peer_offsets=(0,)))
+    assert "_kwargs_cache" not in ws.__dict__
+    assert ws._symmetric_base == 1 << 20 and ws._compiled is None
+
+
+def _plan(**kw):
+    cfg = _kimi_config(max_tokens_per_rank=256)
+    vclass = block_scaled._VariantClass(lo=1, hi=8, config=dataclasses.replace(cfg, max_tokens_per_rank=8), slot=1)
+    fields = dict(classes=(vclass,), slot_bytes=(128, 1024), leading=(("plane", 4096),), total_bytes=(4352, 9216))
+    return cfg, block_scaled._VariantPlan(**(fields | kw))
+
+
+def test_workspace_fingerprint_is_rank_independent_and_covers_the_plan():
+    cfg, plan = _plan()
+    fp = block_scaled._workspace_fingerprint(cfg, plan)
+    assert fp == block_scaled._workspace_fingerprint(dataclasses.replace(cfg, rank=3), plan)
+    assert set(fp) == {"capacity_config", "variants", "slot_bytes", "leading", "total_bytes"}
+    for changed in (
+        dict(slot_bytes=(128, 1152)),
+        dict(total_bytes=(4352, 9344)),
+        dict(leading=(("plane", 8192),)),
+        dict(classes=(dataclasses.replace(plan.classes[0], hi=7),)),
+        dict(classes=(dataclasses.replace(plan.classes[0], config=dataclasses.replace(
+            plan.classes[0].config, mma_tiler_mnk=(256, 128, 256))),)),
+    ):
+        assert block_scaled._workspace_fingerprint(cfg, _plan(**changed)[1]) != fp, changed
+    assert block_scaled._workspace_fingerprint(
+        dataclasses.replace(cfg, cluster_shape_mn=(2, 1)), plan
+    ) != fp
+    assert block_scaled._workspace_fingerprint(cfg, None)["variants"] is None
+
+
+def _two_ranks(monkeypatch, peer_value):
+    """A 2-rank EP group whose peer contributes ``peer_value(local)`` to the all-gather."""
+    monkeypatch.delenv("MEGA_NO_DIST", raising=False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    def gather(results, value, group=None):
+        results[:] = [value, peer_value(value)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+
+
+def test_prepare_local_agreement_raises_on_plan_mismatch(monkeypatch):
+    cfg, plan = _plan()
+    _, other = _plan(slot_bytes=(128, 1152))
+    other_fp = block_scaled._workspace_fingerprint(cfg, other)
+    _two_ranks(monkeypatch, lambda local: (local[0], other_fp))
+    agree = lambda p: block_scaled._workspace_fingerprint(cfg, p["variant_plan"])  # noqa: E731
+    with pytest.raises(RuntimeError, match=r"disagree on ranks \[1\].*slot_bytes"):
+        comm.prepare_local(lambda: {"variant_plan": plan}, 2, phase="session local allocation", agree=agree)
+    # Identical plans pass and return the local result.
+    _two_ranks(monkeypatch, lambda local: local)
+    assert comm.prepare_local(lambda: {"variant_plan": plan}, 2, agree=agree) == {"variant_plan": plan}
+    # Local failures still surface as such.
+    with pytest.raises(RuntimeError, match="failed on EP ranks"):
+        comm.prepare_local(lambda: 1 / 0, 2, agree=agree)
+
+
+def test_symm_buffer_agrees_on_its_workspace_fingerprint(monkeypatch):
+    cfg, plan = _plan()
+    seen = {}
+
+    def prepare_local(prepare, world_size, process_group=None, *, phase, agree=None):
+        seen.update(phase=phase, agree=agree)
+        raise KeyboardInterrupt  # stop before any allocation
+
+    monkeypatch.setattr(comm, "prepare_local", prepare_local)
+    with pytest.raises(KeyboardInterrupt):
+        Sm107BlockScaledSymmBuffer(cfg)
+    assert seen["phase"] == "session local allocation"
+    assert seen["agree"]({"variant_plan": plan}) == block_scaled._workspace_fingerprint(cfg, plan)
+
+
+def test_knob_cache_memo_key_includes_inode(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+    monkeypatch.setattr(knob_cache, "_PARSED_ENTRIES", {})
+    parse = mock.Mock(side_effect=lambda path: [{"parse": parse.call_count}])
+    monkeypatch.setattr(knob_cache, "_parse_entries", parse)
+    stat = dict(st_ino=1, st_mtime_ns=10**18, st_ctime_ns=10**18, st_size=100)
+    monkeypatch.setattr(knob_cache.os, "stat", lambda path: SimpleNamespace(**stat))
+    path = str(tmp_path / "knobs.json")
+    assert knob_cache._load_entries(path) == [{"parse": 1}]
+    assert knob_cache._load_entries(path) == [{"parse": 1}]  # memo hit
+    # os.replace by write_record: new inode, same size, same coarse timestamps.
+    stat["st_ino"] = 2
+    assert knob_cache._load_entries(path) == [{"parse": 2}]
+    assert parse.call_count == 2

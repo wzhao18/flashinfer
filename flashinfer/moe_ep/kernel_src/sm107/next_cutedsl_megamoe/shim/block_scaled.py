@@ -198,29 +198,36 @@ def variant_classes(cfg, config_for_capacity) -> Tuple[_VariantClass, ...]:
     compiled once at its largest size. The bucket bounds what a live batch pays for its kernel's capacity
     (tail-reset and worst-case extents): measured EP8 NVFP4, T2..T128 on one capacity-128 kernel ran
     +1.4..+3.2% over a kernel at capacity T; a kernel at most 2x the batch recovers that.
+
+    A batch size whose own configuration is not variant-eligible (e.g. a tuned knob-cache entry selecting the
+    in-kernel top-k reduction, whose symmetric output variants cannot share) belongs to no class: it runs on
+    the capacity kernel (``variant_for`` returns the workspace for sizes between classes), which serves every
+    batch size up to its capacity, so the result is exactly what the workspace computes without variants.
     """
     if not _variant_eligible(cfg):
         return ()
     top = min(cfg.max_tokens_per_rank - 1, _VARIANT_MAX_TOKENS)
     same_problem = ("num_total_experts", "num_topk", "hidden", "intermediate", "rank", "world_size", "quant_kind")
-    spans: list = []  # [lo, hi, key, config]
+    spans: list = []  # [lo, hi, key, config]; a None entry ends a class at a non-variant batch size
     for tokens in range(1, top + 1):
         vcfg = config_for_capacity(tokens)
-        if (
-            vcfg.max_tokens_per_rank != tokens
-            or not _variant_eligible(vcfg)
-            or any(getattr(vcfg, f) != getattr(cfg, f) for f in same_problem)
+        if vcfg.max_tokens_per_rank != tokens or any(
+            getattr(vcfg, f) != getattr(cfg, f) for f in same_problem
         ):
             raise RuntimeError(f"configuration for {tokens} tokens is not a capacity variant of {cfg}")
+        if not _variant_eligible(vcfg):
+            if spans and spans[-1] is not None:
+                spans.append(None)
+            continue
         key = (variant_policy_key(vcfg), 1 << (tokens - 1).bit_length())
-        if spans and spans[-1][2] == key:
+        if spans and spans[-1] is not None and spans[-1][2] == key:
             spans[-1][1] = tokens
             spans[-1][3] = vcfg
         else:
             spans.append([tokens, tokens, key, vcfg])
     return tuple(
         _VariantClass(lo=lo, hi=hi, config=vcfg, slot=index + 1)
-        for index, (lo, hi, _key, vcfg) in enumerate(spans)
+        for index, (lo, hi, _key, vcfg) in enumerate(s for s in spans if s is not None)
     )
 
 
@@ -259,6 +266,31 @@ def _plan_variants(cfg, config_for_capacity) -> Optional[_VariantPlan]:
     plan.total_bytes = tuple(totals)
     plan.kernels = tuple(kernels)
     return plan
+
+
+def _config_digest(cfg: "Sm107BlockScaledMoeConfig") -> str:
+    """Rank-independent digest of a configuration (every field but ``rank``)."""
+    import hashlib
+
+    return hashlib.sha256(repr(dataclasses.replace(cfg, rank=0)).encode()).hexdigest()[:16]
+
+
+def _workspace_fingerprint(cfg: "Sm107BlockScaledMoeConfig", plan: Optional[_VariantPlan]) -> dict:
+    """What every EP rank must resolve identically before the symmetric allocation.
+
+    ``knobs=None`` and ``"cache"`` resolve the capacity configuration and every variant class from each rank's
+    own read of the knob cache; the symmetric offsets of every kernel's reset slot and data regions follow from
+    it, so ranks that read different caches would peer-write at offsets the receiving kernel does not use.
+    """
+    if plan is None:
+        return dict(capacity_config=_config_digest(cfg), variants=None)
+    return dict(
+        capacity_config=_config_digest(cfg),
+        variants=tuple((c.lo, c.hi, c.slot, _config_digest(c.config)) for c in plan.classes),
+        slot_bytes=tuple(plan.slot_bytes),
+        leading=tuple(plan.leading),
+        total_bytes=tuple(plan.total_bytes),
+    )
 
 
 def _staging_view(name: str) -> property:
@@ -770,6 +802,7 @@ class Sm107BlockScaledSymmBuffer:
             config.world_size,
             process_group,
             phase="session local allocation",
+            agree=lambda p: _workspace_fingerprint(config, p["variant_plan"]),
         )
         execution = prepared.pop("execution")
         self.device = prepared.pop("device")
@@ -1091,6 +1124,8 @@ class Sm107BlockScaledSymmBuffer:
         self._symmetric_base = base
         self._peer_offsets = peer_offsets
 
+        # Cached launch bindings name the previous workspaces and peer offsets.
+        self.__dict__.pop("_kwargs_cache", None)
         self._compiled: Optional[Any] = None
         self._launch_key: Optional[tuple] = None
         self._launch_kwargs: Optional[dict] = None
@@ -1293,13 +1328,6 @@ class Sm107BlockScaledSymmBuffer:
         """
         stream = torch.cuda.current_stream()
         own = self.__dict__  # this kernel's own staging views, whatever variant is selected
-        if output is None:
-            output = own["_own_output_activation"]
-        # Separate reduction can write only the live rows, directly into the
-        # caller's output. Keep the row extent dynamic so warmed kernels also
-        # accept another batch size during CUDA graph capture.
-        output_cute = _to_cute(output, dynamic_leading=False)
-        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
         topk_idx = own["_own_topk_idx"]
         if live_tokens is not None:
             topk_idx = topk_idx[: max(int(live_tokens), 1)]
@@ -1312,7 +1340,7 @@ class Sm107BlockScaledSymmBuffer:
             "fc1_weight_sf": _to_cute(transformed_l1[1]),
             "fc2_weight": _to_cute(transformed_l2[0]),
             "fc2_weight_sf": _to_cute(transformed_l2[1]),
-            "output_activation": output_cute,
+            "output_activation": self._output_kwarg(output),
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
@@ -1328,6 +1356,17 @@ class Sm107BlockScaledSymmBuffer:
                 else {}
             ),
         }
+
+    def _output_kwarg(self, output: Optional[torch.Tensor]):
+        """Output binding (default: the workspace buffer)."""
+        if output is None:
+            output = self.__dict__["_own_output_activation"]
+        # Separate reduction can write only the live rows, directly into the
+        # caller's output. Keep the row extent dynamic so warmed kernels also
+        # accept another batch size during CUDA graph capture.
+        output_cute = _to_cute(output, dynamic_leading=False)
+        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        return output_cute
 
     def _sm_locality_domain(self) -> torch.Tensor:
         """Die of every SM (``die_local.sm_locality_domain_map``), for the die_split scheduler."""
@@ -1403,7 +1442,7 @@ class Sm107BlockScaledSymmBuffer:
                     f"{self.config.max_tokens_per_rank}"
                 )
         self._validate_batch_invariant_scalars()
-        key = (
+        binding = (
             self.batch_invariant_fingerprint,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
@@ -1416,28 +1455,36 @@ class Sm107BlockScaledSymmBuffer:
                 for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             ),
+            torch.cuda.current_stream().cuda_stream,
+            live_tokens,
+        )
+        key = binding + (
             None
             if output is None
             else (output.data_ptr(), output.shape, output.stride()),
-            torch.cuda.current_stream().cuda_stream,
-            live_tokens,
         )
         if self._compiled is None or self._launch_key != key:
             if self._compiled is None:
                 comm.ensure_not_capturing("SM107 mega kernel compile")
-            # DLPack metadata binding and stream conversion are host-only and
-            # cached per key (live row count, output, layer weights, stream).
+            # DLPack metadata binding and stream conversion are host-only. The
+            # bindings of the workspace's own buffers are cached per (live row
+            # count, layer weights, scalars, stream); a caller output is bound
+            # per key change and never cached, so at most the latest one
+            # (_launch_output) stays referenced. Cleared whenever the bound
+            # workspaces are released or rebound (_bind_execution_state).
             cache = self.__dict__.setdefault("_kwargs_cache", {})
-            kwargs = cache.get(key)
-            if kwargs is None:
-                kwargs = self._runtime_kwargs(
-                    transformed_l1, transformed_l2, output, live_tokens
+            entry = cache.get(binding)
+            if entry is None:
+                entry = (
+                    self._runtime_kwargs(transformed_l1, transformed_l2, None, live_tokens),
+                    (transformed_l1, transformed_l2),
                 )
                 if len(cache) >= 64:
                     cache.clear()
-                cache[key] = (kwargs, (transformed_l1, transformed_l2), output)
-            else:
-                kwargs = kwargs[0]
+                cache[binding] = entry
+            kwargs = entry[0]
+            if output is not None:
+                kwargs = {**kwargs, "output_activation": self._output_kwarg(output)}
             if self._compiled is None:
                 self._compiled = cute.compile(self.kernel, **kwargs)
             self._launch_key = key
@@ -1481,6 +1528,7 @@ class Sm107BlockScaledSymmBuffer:
 
     def _release_execution_state(self) -> None:
         """Drop cached tensor references and free owned symmetric buffers."""
+        self.__dict__.pop("_kwargs_cache", None)  # binds the buffers freed below
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None

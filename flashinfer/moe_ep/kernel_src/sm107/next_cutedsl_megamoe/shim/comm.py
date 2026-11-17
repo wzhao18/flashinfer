@@ -22,12 +22,16 @@ def prepare_local(
     process_group: Any = None,
     *,
     phase: str = "local preparation",
+    agree: Optional[Callable[[Any], Any]] = None,
 ) -> _Prepared:
     """Agree on rank-local failures before any following symmetric operation.
 
     Only call at a collective preparation boundary, never from a rank-local
     compile-cache miss or a steady-state/captured launch. Failed local trials
     must not release symmetric storage that the existing session still owns.
+    ``agree(result)`` gives a compact value (a dict of named fields) every rank
+    must produce identically; it rides on the same all-gather, and a mismatch
+    raises on every rank naming the differing fields.
     """
     if world_size <= 1 or _no_dist():
         return prepare()
@@ -35,19 +39,43 @@ def prepare_local(
 
     if not dist.is_initialized() or dist.get_world_size(process_group) != world_size:
         raise RuntimeError("MegaMoE preparation requires the matching EP process group")
-    result, error = None, None
+    result, error, value = None, None, None
     try:
         result = prepare()
+        if agree is not None:
+            value = agree(result)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    errors = [None] * world_size
-    dist.all_gather_object(errors, error, group=process_group)
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, (error, value), group=process_group)
+    errors = [g[0] for g in gathered]
     if any(errors):
         # Do not retain successful peers' temporary local tensors in this
         # exception's traceback. Existing symmetric owners are untouched.
         result = None
         raise RuntimeError(f"MegaMoE {phase} failed on EP ranks: {errors}")
+    mismatch = disagreement([g[1] for g in gathered])
+    if mismatch is not None:
+        result = None
+        raise RuntimeError(f"MegaMoE {phase}: EP ranks disagree on {mismatch}")
     return cast(_Prepared, result)
+
+
+def disagreement(values: list) -> Optional[str]:
+    """None when every rank's value is equal, else which ranks and fields differ from rank 0."""
+    ranks = [r for r, v in enumerate(values) if v != values[0]]
+    if not ranks:
+        return None
+    first, other = values[0], values[ranks[0]]
+    if isinstance(first, dict) and isinstance(other, dict):
+        fields = sorted(k for k in first.keys() | other.keys() if first.get(k) != other.get(k))
+        detail = "; ".join(f"{k}: rank 0 {first.get(k)!r} vs rank {ranks[0]} {other.get(k)!r}" for k in fields)
+    else:
+        detail = f"rank 0 {first!r} vs rank {ranks[0]} {other!r}"
+    return (
+        f"ranks {ranks} differ from rank 0 ({detail}); every EP rank must resolve the same "
+        "configuration (e.g. read the same knob cache contents)"
+    )
 
 
 def _no_dist() -> bool:
