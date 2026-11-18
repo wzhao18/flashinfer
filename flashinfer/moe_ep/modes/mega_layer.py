@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import dataclasses
 import warnings
 import weakref
@@ -506,6 +508,35 @@ class MoEEpMegaLayer(nn.Module):
             # steady-state signature instead of pinning it to the dummy batch.
             _, warmed_workspace, _ = self._resolve_workspace(workspace)
             self._forward_signatures.pop(id(warmed_workspace), None)
+
+    def prepare(
+        self,
+        batch_sizes: "Sequence[int]",
+        *,
+        workspace: MoEEpMegaWorkspace | None = None,
+    ) -> dict[int, int]:
+        """Compile the kernels for the given batch sizes ahead of time.
+
+        Backends that specialize the kernel per batch size (Rubin block-scaled
+        inference) compile one kernel per policy class of ``batch_sizes`` --
+        typically the engine's CUDA-graph capture sizes -- sharing the
+        workspace's memory, and later select among the compiled kernels on the
+        host by ``MoEEpTensors.runtime_max_tokens_per_rank`` (no compile on
+        the request path or during capture). Returns ``{batch size: capacity of
+        the kernel that serves it}`` (empty for backends without variants).
+
+        Call on ALL EP ranks with the same sizes, outside graph capture (the
+        workspace is allocated here if needed, which is collective).
+        """
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError("MegaMoE prepare cannot run during CUDA graph capture")
+        _fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
+        prepare_batch_sizes = getattr(kernel, "prepare_batch_sizes", None)
+        if prepare_batch_sizes is None:
+            return {}
+        return prepare_batch_sizes(
+            backend_workspace, self._get_transformed_weights(), list(batch_sizes)
+        )
 
     def get_tuned_knobs(
         self, *, workspace: MoEEpMegaWorkspace | None = None

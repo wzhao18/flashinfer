@@ -1062,8 +1062,10 @@ class _MetadataPushRouter(KernelComponent):
         grid_thread_count = self.router_data_cta_count * self.router_warps_per_cta * 32
         tile_span = elements_per_vector * grid_thread_count
         maximum_elements = self.max_tokens_per_rank * self.topk
-        actual_token_count = Int32(self.max_tokens_per_rank)
-        actual_elements = Int32(maximum_elements)
+        # Live rows = the routing tensor's runtime extent (<= max_tokens_per_rank): rows past it are never loaded
+        # and count as invalid routes, so one compiled kernel serves every live batch of its capacity.
+        actual_token_count = Int32(cute.size(topk_indices, mode=[0]))
+        actual_elements = actual_token_count * Int32(self.topk)
         load_round_count = ceil_div(maximum_elements, tile_span)
         elements_per_thread = load_round_count * elements_per_vector
 

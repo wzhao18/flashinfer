@@ -98,6 +98,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
             "die_split": OptionalRequirement(bool),
+            # ((local data offset, shared data offset), ((data region, reserved bytes), ...)): see
+            # DeviceWorkspace.set_data_layout. Lets several kernels share one workspace allocation.
+            "workspace_data_layout": OptionalRequirement(Optional[tuple]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -142,6 +145,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.workspace_data_layout = impl_desc.get("workspace_data_layout")
 
         self.occupancy = 1
         self.architecture = "sm_107"
@@ -425,6 +429,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # single NVLink barrier (TokenComm.reset_tail). The NVLink barrier phase
         # counter advances once per call and supplies the parity.
         device_workspace.enable_tail_parity(NvlinkBarrier.phase_counter_region)
+        if self.workspace_data_layout is not None:
+            data_start, leading_data = self.workspace_data_layout
+            device_workspace.set_data_layout(tuple(data_start), tuple(tuple(item) for item in leading_data))
         device_workspace.finalize()
         return device_workspace
 
@@ -487,6 +494,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             + bi_suffix
+            # Workspace region offsets are codegen-time constants.
+            + (
+                ""
+                if self.workspace_data_layout is None
+                else "_wsl" + "x".join(str(v) for v in self.workspace_data_layout[0])
+                + "".join(f"_{name.rsplit('.', 1)[-1]}{nbytes}" for name, nbytes in self.workspace_data_layout[1])
+            )
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):

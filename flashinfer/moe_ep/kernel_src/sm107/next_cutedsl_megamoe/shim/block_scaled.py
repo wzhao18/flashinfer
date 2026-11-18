@@ -63,6 +63,249 @@ _SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
 # die_split (two-ended expert claim over die-local weights) up to this many expected rows per local expert.
 _DIE_SPLIT_MAX_ROWS_PER_EXPERT = 1536
 
+# Batch-size variants (automatic per-shape policy, no flag). Every capacity-derived compile-time choice of the
+# kernel (S1 decode landing and the token_in dynamic claim, router data-CTA geometry, the N tile, die_split, the
+# tail-reset extents) follows the WORKSPACE capacity, while a server sized for prefill (vLLM decode:
+# max_num_batched_tokens 8192 tokens/rank) runs its CUDA-graph steps at a small padded batch. An inference workspace
+# therefore also owns one kernel per policy class of batch sizes 1.._VARIANT_MAX_TOKENS: batch sizes whose
+# compile-time choices are identical (variant_policy_key) share one kernel, compiled at the class's largest size;
+# the live row count is a runtime argument of every kernel (router loads, staging tail). All variants share the
+# workspace's allocations: each owns a private reset-state slot, and their data regions start at one common
+# address with the post-kernel combine plane placed first at the workspace's own size (see _VariantPlan).
+# Measured EP8 NVFP4 (capacity 8192 / capacity = T): T64 189.2 / 154.2 us, T256 193.4 / 167.8, T512 204.3 / 180.4,
+# T1024 229.0 / 226.3, T2048 372.4 / 372.1: the capacity costs nothing from 2048 tokens on.
+_VARIANT_MAX_TOKENS = 1024
+
+
+def _variant_eligible(cfg: "Sm107BlockScaledMoeConfig") -> bool:
+    """Variants exist for the inference kernel with separate top-k reduction.
+
+    GenPhase and batch-invariant workspaces keep one configuration (their arithmetic receipt covers it); the
+    in-kernel reduction peer-writes a symmetric output that variants would have to share at one layout.
+    """
+    return (
+        cfg.kernel_variant == "inference"
+        and not cfg.batch_invariant
+        and not cfg.reduce_topk_in_kernel
+    )
+
+
+def _die_split_policy(cfg: "Sm107BlockScaledMoeConfig") -> bool:
+    """die_split choice of :meth:`Sm107BlockScaledSymmBuffer._build_kernel` (one source of truth)."""
+    if cfg.kernel_variant == "genphase" or cfg.schedule_policy[0] != "phase_interleave":
+        return False
+    from .die_local import locality_domain_count
+
+    rows_per_expert = cfg.max_tokens_per_rank * cfg.world_size * cfg.num_topk / cfg.num_total_experts
+    return (
+        locality_domain_count(torch.cuda.current_device()) >= 2
+        and rows_per_expert <= _DIE_SPLIT_MAX_ROWS_PER_EXPERT
+    )
+
+
+def variant_policy_key(cfg: "Sm107BlockScaledMoeConfig") -> tuple:
+    """Compile-time choices of the kernel for ``cfg`` other than its capacity.
+
+    Two capacities with equal keys compile the same code paths; they differ only in region extents and loop
+    bounds over the capacity, which a live row count below the capacity skips. Mirrors the trace-time gates
+    of the vendored router / token_in (checked against the built kernel in :func:`_check_policy_key`).
+    """
+    from sources.communication.nvlink_domain.token_comm import (
+        TokenCommNonDeterministic,
+        _MetadataPushRouter,
+    )
+
+    routes = cfg.padded_tokens_per_rank * cfg.num_topk
+    cta_capacity = min(16384, 1 << (max(routes, 2048) - 1).bit_length())
+    data_ctas = -(-routes // cta_capacity)
+    landing = (
+        routes <= _MetadataPushRouter.decode_landing_max_routes
+        and cfg.world_size <= _MetadataPushRouter.decode_landing_max_world_size
+        and data_ctas == 1
+    )
+    dynamic_claim = routes <= TokenCommNonDeterministic.token_in_dynamic_claim_max_routes
+    return (
+        dataclasses.replace(cfg, max_tokens_per_rank=1),
+        cta_capacity,
+        data_ctas,
+        landing,
+        dynamic_claim,
+        _die_split_policy(cfg),
+    )
+
+
+def _check_policy_key(key: tuple, kernel) -> None:
+    _, cta_capacity, data_ctas, landing, dynamic_claim, die_split = key
+    router = kernel.token_comm._router
+    built = (
+        router.router_tokens_per_cta,
+        router.router_data_cta_count,
+        router.decode_landing,
+        kernel.token_comm.token_in_dynamic_claim,
+        bool(getattr(kernel.scheduler, "die_split", False)),
+    )
+    if built != (cta_capacity, data_ctas, landing, dynamic_claim, die_split):
+        raise RuntimeError(f"variant policy key {key[1:]} does not match the built kernel {built}")
+
+
+@dataclasses.dataclass(frozen=True)
+class _VariantClass:
+    """Batch sizes ``lo..hi`` share one kernel compiled at capacity ``hi`` (``config``)."""
+
+    lo: int
+    hi: int
+    config: "Sm107BlockScaledMoeConfig"
+    slot: int
+
+
+@dataclasses.dataclass
+class _VariantPlan:
+    """One allocation per workspace space shared by the capacity kernel (slot 0) and every variant.
+
+    Variant ``v`` binds its workspaces at ``base + v * slot_bytes``: its reset prefix (tail-reset copies,
+    zero-on-first-allocate barrier and grid-sync state) lies in its own slot, so variants never disturb each
+    other's cross-call state, and its data regions start at ``base + slots * slot_bytes`` like everyone's. The
+    shared combine plane, which the separate top-k reduction reads AFTER the kernel (when peers may already run
+    the next call and write their early regions), is placed first in every kernel at the capacity kernel's size,
+    so it never overlaps another kernel's peer-written regions; all other data is read before the kernel's tail
+    NVLink barrier and rewritten every call.
+    """
+
+    classes: Tuple[_VariantClass, ...]
+    slot_bytes: Tuple[int, int]  # (local, shared)
+    leading: Tuple[Tuple[str, int], ...]
+    total_bytes: Tuple[int, int]
+    kernels: tuple = ()  # built kernel per slot (0 = the capacity kernel)
+
+    @property
+    def slots(self) -> int:
+        return len(self.classes) + 1
+
+    def layout(self, slot: int) -> tuple:
+        data_start = tuple((self.slots - slot) * b for b in self.slot_bytes)
+        return (data_start, self.leading)
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def variant_classes(cfg, config_for_capacity) -> Tuple[_VariantClass, ...]:
+    """Policy classes of batch sizes ``1..min(capacity - 1, _VARIANT_MAX_TOKENS)`` of a workspace.
+
+    ``config_for_capacity(T)`` is the configuration the workspace would have at capacity ``T``. Consecutive
+    batch sizes with equal :func:`variant_policy_key` and the same power-of-two capacity bucket form one class,
+    compiled once at its largest size. The bucket bounds what a live batch pays for its kernel's capacity
+    (tail-reset and worst-case extents): measured EP8 NVFP4, T2..T128 on one capacity-128 kernel ran
+    +1.4..+3.2% over a kernel at capacity T; a kernel at most 2x the batch recovers that.
+
+    A batch size whose own configuration is not variant-eligible (e.g. a tuned knob-cache entry selecting the
+    in-kernel top-k reduction, whose symmetric output variants cannot share) belongs to no class: it runs on
+    the capacity kernel (``variant_for`` returns the workspace for sizes between classes), which serves every
+    batch size up to its capacity, so the result is exactly what the workspace computes without variants.
+    """
+    if not _variant_eligible(cfg):
+        return ()
+    top = min(cfg.max_tokens_per_rank - 1, _VARIANT_MAX_TOKENS)
+    same_problem = ("num_total_experts", "num_topk", "hidden", "intermediate", "rank", "world_size", "quant_kind")
+    spans: list = []  # [lo, hi, key, config]; a None entry ends a class at a non-variant batch size
+    for tokens in range(1, top + 1):
+        vcfg = config_for_capacity(tokens)
+        if vcfg.max_tokens_per_rank != tokens or any(
+            getattr(vcfg, f) != getattr(cfg, f) for f in same_problem
+        ):
+            raise RuntimeError(f"configuration for {tokens} tokens is not a capacity variant of {cfg}")
+        if not _variant_eligible(vcfg):
+            if spans and spans[-1] is not None:
+                spans.append(None)
+            continue
+        key = (variant_policy_key(vcfg), 1 << (tokens - 1).bit_length())
+        if spans and spans[-1] is not None and spans[-1][2] == key:
+            spans[-1][1] = tokens
+            spans[-1][3] = vcfg
+        else:
+            spans.append([tokens, tokens, key, vcfg])
+    return tuple(
+        _VariantClass(lo=lo, hi=hi, config=vcfg, slot=index + 1)
+        for index, (lo, hi, _key, vcfg) in enumerate(s for s in spans if s is not None)
+    )
+
+
+def _plan_variants(cfg, config_for_capacity) -> Optional[_VariantPlan]:
+    """Variant classes of a workspace and their shared layout (None: the workspace has no variants)."""
+    classes = variant_classes(cfg, config_for_capacity)
+    if not classes:
+        return None
+    build = Sm107BlockScaledSymmBuffer._build_kernel
+    plain = [build(cfg)] + [build(c.config) for c in classes]
+    for c, kernel in zip(classes, plain[1:]):
+        _check_policy_key(variant_policy_key(c.config), kernel)
+    state = [
+        max(k._device_workspace.zero_on_allocate_bytes(space) for k in plain)
+        for space in ("local", "shared")
+    ]
+    slot_bytes = tuple(_round_up(max(b, 1), 128) for b in state)
+    token_comm = plain[0].token_comm
+    workspace = plain[0]._device_workspace
+    leading = tuple(
+        (name, int(workspace.nbytes(name)))
+        for name in (
+            token_comm.pre_reduced_activation_region,
+            token_comm.pre_reduced_activation_sf_region,
+        )
+        if name in workspace._region_by_name
+    )
+    plan = _VariantPlan(classes=classes, slot_bytes=slot_bytes, leading=leading, total_bytes=(0, 0))
+    totals = [0, 0]
+    kernels = []
+    for slot, vcfg in enumerate([cfg] + [c.config for c in classes]):
+        kernel = build(vcfg, data_layout=plan.layout(slot))
+        kernels.append(kernel)
+        for i, space in enumerate(("local", "shared")):
+            totals[i] = max(totals[i], slot * slot_bytes[i] + int(kernel._device_workspace.total_bytes(space)))
+    plan.total_bytes = tuple(totals)
+    plan.kernels = tuple(kernels)
+    return plan
+
+
+def _config_digest(cfg: "Sm107BlockScaledMoeConfig") -> str:
+    """Rank-independent digest of a configuration (every field but ``rank``)."""
+    import hashlib
+
+    return hashlib.sha256(repr(dataclasses.replace(cfg, rank=0)).encode()).hexdigest()[:16]
+
+
+def _workspace_fingerprint(cfg: "Sm107BlockScaledMoeConfig", plan: Optional[_VariantPlan]) -> dict:
+    """What every EP rank must resolve identically before the symmetric allocation.
+
+    ``knobs=None`` and ``"cache"`` resolve the capacity configuration and every variant class from each rank's
+    own read of the knob cache; the symmetric offsets of every kernel's reset slot and data regions follow from
+    it, so ranks that read different caches would peer-write at offsets the receiving kernel does not use.
+    """
+    if plan is None:
+        return dict(capacity_config=_config_digest(cfg), variants=None)
+    return dict(
+        capacity_config=_config_digest(cfg),
+        variants=tuple((c.lo, c.hi, c.slot, _config_digest(c.config)) for c in plan.classes),
+        slot_bytes=tuple(plan.slot_bytes),
+        leading=tuple(plan.leading),
+        total_bytes=tuple(plan.total_bytes),
+    )
+
+
+def _staging_view(name: str) -> property:
+    """Workspace tensor of the selected live bucket (the workspace's own when none is selected)."""
+    own = "_own_" + name
+
+    def fget(self):
+        active = self.__dict__.get("_active")
+        return getattr(active, name) if active is not None else self.__dict__.get(own)
+
+    def fset(self, value) -> None:
+        self.__dict__[own] = value
+
+    return property(fget, fset, doc=f"``{name}`` of the selected live bucket.")
+
 
 def _require_sm107() -> None:
     cc = torch.cuda.get_device_capability()
@@ -508,25 +751,66 @@ class Sm107BlockScaledSymmBuffer:
     Owns the staging tensors the backend fills (``x``, ``x_sf``, ``topk_idx``,
     ``topk_weights``), the kernel + device workspaces, and the compile cache.
     Create via :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe`.
+
+    Batch-size variants (``variants=True``, inference kernels with separate
+    top-k reduction): besides the capacity kernel, the workspace owns one
+    kernel per policy class of batch sizes up to ``_VARIANT_MAX_TOKENS``
+    (:func:`variant_policy_key`; ``config_for_capacity`` gives the knobs of a
+    capacity, e.g. the backend's per-shape policy). Variants share every
+    allocation of the workspace (:class:`_VariantPlan`) and its staging rows.
+    :meth:`prepare_batch_sizes` compiles the variants of a list of batch
+    sizes (e.g. the CUDA-graph capture sizes) ahead of time; nothing compiles
+    later on their behalf. :meth:`select_live_tokens` (host, before staging)
+    picks the kernel of one step from the EP-uniform step maximum; the staging
+    tensors, ``output_activation``, ``prepare`` and ``launch`` then follow the
+    selection. Every EP rank must prepare and select alike.
     """
 
+    x = _staging_view("x")
+    x_sf = _staging_view("x_sf")
+    topk_idx = _staging_view("topk_idx")
+    topk_weights = _staging_view("topk_weights")
+    output_activation = _staging_view("output_activation")
+    # Class defaults keep partially constructed workspaces (tests, object.__new__) on the full-capacity kernel.
+    _active: Optional["Sm107BlockScaledSymmBuffer"] = None
+    _variant_plan: Optional[_VariantPlan] = None
+    _variants: Tuple["Sm107BlockScaledSymmBuffer", ...] = ()
+    _variant_root: Optional["Sm107BlockScaledSymmBuffer"] = None
+    _variant_class: Optional[_VariantClass] = None
+
     def __init__(
-        self, config: Sm107BlockScaledMoeConfig, *, process_group=None
+        self,
+        config: Sm107BlockScaledMoeConfig,
+        *,
+        process_group=None,
+        variants: bool = True,
+        config_for_capacity=None,
     ) -> None:
         """Allocate session buffers, including independent NVFP4 default scalars."""
+        self._active = None
+        self._variants = ()
         self.config = config
         self._process_group = process_group
+        self._config_for_capacity = (
+            config_for_capacity
+            if config_for_capacity is not None
+            else (lambda tokens: dataclasses.replace(config, max_tokens_per_rank=tokens))
+        )
+        self._want_variants = bool(variants)
         prepared = comm.prepare_local(
             self._prepare_session_local,
             config.world_size,
             process_group,
             phase="session local allocation",
+            agree=lambda p: _workspace_fingerprint(config, p["variant_plan"]),
         )
         execution = prepared.pop("execution")
         self.device = prepared.pop("device")
         self.kernel = prepared.pop("kernel")
         self.sf_cols = prepared.pop("sf_cols")
         self.topk_idx = prepared.pop("topk_idx")
+        self._variant_plan = prepared.pop("variant_plan")
+        variant_kernels = prepared.pop("variant_kernels")
         self.__dict__.update(prepared)
         cfg = config
         tokens = cfg.padded_tokens_per_rank
@@ -551,6 +835,120 @@ class Sm107BlockScaledSymmBuffer:
         self._bound_scalars: dict = {}
 
         self._validate_batch_invariant_scalars()
+        if self._variant_plan is not None:
+            self._variants = tuple(
+                self._make_variant(c, kernel)
+                for c, kernel in zip(self._variant_plan.classes, variant_kernels)
+            )
+
+    def _make_variant(self, vclass: _VariantClass, kernel) -> "Sm107BlockScaledSymmBuffer":
+        """A kernel of this workspace's variant plan: no allocation, views of this workspace only."""
+        variant = object.__new__(Sm107BlockScaledSymmBuffer)
+        cfg = vclass.config
+        own = self.__dict__
+        rows = cfg.padded_tokens_per_rank
+        variant._active = None
+        variant._variants = ()
+        variant._variant_root = self
+        variant._variant_class = vclass
+        variant.config = cfg
+        variant._process_group = self._process_group
+        variant.device = self.device
+        variant.kernel = kernel
+        variant.sf_cols = int(kernel.token_comm.activation_sf_hidden_padded)
+        if variant.sf_cols != self.sf_cols:
+            raise RuntimeError("variant scale layout differs from its workspace")
+        # Leading rows of the workspace's staging and output tensors: peers pull a token row at the same symmetric
+        # address whichever kernel runs, and the routing tail past the live rows is never read.
+        variant.x = own["_own_x"][:rows]
+        variant.x_sf = own["_own_x_sf"][:rows]
+        variant.topk_weights = own["_own_topk_weights"][:rows]
+        variant.topk_idx = own["_own_topk_idx"][:rows]
+        variant.output_activation = own["_own_output_activation"][:rows]
+        local_slot, shared_slot = self._variant_plan.slot_bytes
+        variant.local_workspace = self.local_workspace[vclass.slot * local_slot :]
+        variant.shared_workspace = self.shared_workspace[vclass.slot * shared_slot :]
+        for name in (*_SCALAR_NAMES, "_default_scalar"):
+            setattr(variant, name, getattr(self, name, None))
+        variant._staged_tokens = None
+        variant._destroyed = False
+        variant._tuning_state = AutoTuningState()
+        variant._tuning_inputs = None
+        variant._routing_checks = {}
+        variant._bound_scalars = {}
+        variant._bind_execution_state(peers_of=self)
+        return variant
+
+    @property
+    def variant_capacities(self) -> Tuple[int, ...]:
+        """Capacity (largest batch size) of every variant class, ascending."""
+        return tuple(v.config.max_tokens_per_rank for v in self._variants)
+
+    @property
+    def compiled_variant_capacities(self) -> Tuple[int, ...]:
+        return tuple(v.config.max_tokens_per_rank for v in self._variants if v._compiled is not None)
+
+    def variant_for(self, tokens: int) -> "Sm107BlockScaledSymmBuffer":
+        """The kernel whose policy class holds ``tokens`` (the capacity kernel past the classes)."""
+        for variant in self._variants:
+            if tokens <= variant.config.max_tokens_per_rank:
+                return variant if tokens >= variant._variant_class.lo else self
+        return self
+
+    def prepare_batch_sizes(
+        self,
+        batch_sizes,
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> dict:
+        """Compile the kernel of every batch size (and the capacity kernel) ahead of time.
+
+        Call outside graph capture with the same sizes on every EP rank, e.g. the CUDA-graph capture sizes;
+        batch sizes that share a policy class share one compiled kernel. Returns ``{batch size: capacity of
+        its kernel}``. Afterwards a step selects only among compiled kernels (no compile on the request path).
+        """
+        comm.ensure_not_capturing("SM107 batch-size variant compile")
+        selected = {}
+        for tokens in sorted({int(t) for t in batch_sizes}):
+            if not 0 < tokens <= self.config.max_tokens_per_rank:
+                raise ValueError(
+                    f"batch size {tokens} outside (0, {self.config.max_tokens_per_rank}]"
+                )
+            kernel = self.variant_for(tokens)
+            if kernel._compiled is None:
+                kernel._prepare_self(transformed_l1, transformed_l2, live_tokens=tokens)
+            selected[tokens] = kernel.config.max_tokens_per_rank
+        if self._compiled is None:
+            self._prepare_self(transformed_l1, transformed_l2)
+        return selected
+
+    def select_live_tokens(
+        self, ep_max_tokens: Optional[int], num_tokens: int
+    ) -> Optional[int]:
+        """Pick the kernel for the next step; call before staging its inputs (host only, no device sync).
+
+        ``ep_max_tokens`` is the step's largest live token count over the EP
+        ranks (the same on every rank, ``MoEEpTensors.runtime_max_tokens_per_rank``);
+        the compiled variant whose class holds it runs. ``None`` selects the
+        full-capacity kernel, except on a single rank, where ``num_tokens`` is
+        that maximum. Returns the selected capacity.
+        """
+        if ep_max_tokens is None and self.config.world_size == 1:
+            ep_max_tokens = num_tokens
+        if ep_max_tokens is not None and not (
+            num_tokens <= ep_max_tokens <= self.config.max_tokens_per_rank
+        ):
+            raise ValueError(
+                f"runtime_max_tokens_per_rank={ep_max_tokens} must cover this "
+                f"rank's {num_tokens} tokens within capacity "
+                f"{self.config.max_tokens_per_rank}"
+            )
+        self._active = None
+        if ep_max_tokens is not None and self._variants:
+            kernel = self.variant_for(ep_max_tokens)
+            if kernel is not self and kernel._compiled is not None:
+                self._active = kernel
+        return (self._active or self).config.max_tokens_per_rank
 
     def _prepare_session_local(self) -> dict:
         """Finish every local allocation before entering the symmetric heap."""
@@ -559,7 +957,12 @@ class Sm107BlockScaledSymmBuffer:
         _configure_dsl_arch()
         cfg = self.config
         device = torch.device("cuda", torch.cuda.current_device())
-        kernel = self._build_kernel(cfg)
+        plan = (
+            _plan_variants(cfg, self._config_for_capacity)
+            if self._want_variants
+            else None
+        )
+        kernel = self._build_kernel(cfg) if plan is None else plan.kernels[0]
         prepared = dict(
             device=device,
             kernel=kernel,
@@ -574,7 +977,9 @@ class Sm107BlockScaledSymmBuffer:
                 dtype=torch.int32,
                 device=device,
             ),
-            execution=self._prepare_execution_local(cfg, kernel),
+            execution=self._prepare_execution_local(cfg, kernel, plan),
+            variant_plan=plan,
+            variant_kernels=[] if plan is None else list(plan.kernels[1:]),
         )
         for name in (*_SCALAR_NAMES, "_default_scalar"):
             prepared[name] = (
@@ -616,9 +1021,11 @@ class Sm107BlockScaledSymmBuffer:
         self._validate_batch_invariant_scalars()
         return block_scaled_batch_invariant_fingerprint(self.config, arch="sm_107")
 
-    def _prepare_execution_local(self, cfg, kernel) -> dict:
+    def _prepare_execution_local(self, cfg, kernel, plan=None) -> dict:
         workspace = kernel._device_workspace
-        local_bytes = int(workspace.total_bytes("local"))
+        local_bytes = int(
+            workspace.total_bytes("local") if plan is None else plan.total_bytes[0]
+        )
         local = torch.zeros((max(local_bytes, 1),), dtype=torch.uint8, device="cuda")
         if local.data_ptr() % 128:
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
@@ -661,7 +1068,10 @@ class Sm107BlockScaledSymmBuffer:
             self.output_activation = prepared["output_activation"]
 
         workspace = kernel._device_workspace
-        shared_bytes = int(workspace.total_bytes("shared"))
+        plan = getattr(self, "_variant_plan", None)
+        shared_bytes = int(
+            workspace.total_bytes("shared") if plan is None else plan.total_bytes[1]
+        )
         # Allocated fully zeroed, which covers require_zero_workspace_leading_bytes.
         self.local_workspace = prepared["local_workspace"]
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
@@ -672,7 +1082,7 @@ class Sm107BlockScaledSymmBuffer:
             phase="symmetric workspace binding",
         )
 
-    def _bind_execution_state(self) -> None:
+    def _bind_execution_state(self, peers_of=None) -> None:
         cfg, kernel = self.config, self.kernel
         tokens = cfg.padded_tokens_per_rank
         workspace = kernel._device_workspace
@@ -704,12 +1114,18 @@ class Sm107BlockScaledSymmBuffer:
         ):
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
 
-        base, peer_offsets = comm.compute_peer_offsets(
-            self.shared_workspace, cfg.world_size
-        )
+        if peers_of is None:
+            base, peer_offsets = comm.compute_peer_offsets(
+                self.shared_workspace, cfg.world_size
+            )
+        else:
+            # One heap-wide peer delta (comm.compute_peer_offsets) also serves views of the same heap.
+            base, peer_offsets = peers_of._symmetric_base, peers_of._peer_offsets
         self._symmetric_base = base
         self._peer_offsets = peer_offsets
 
+        # Cached launch bindings name the previous workspaces and peer offsets.
+        self.__dict__.pop("_kwargs_cache", None)
         self._compiled: Optional[Any] = None
         self._launch_key: Optional[tuple] = None
         self._launch_kwargs: Optional[dict] = None
@@ -719,7 +1135,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_output: Optional[torch.Tensor] = None
 
     @staticmethod
-    def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
+    def _build_kernel(cfg: Sm107BlockScaledMoeConfig, data_layout: Optional[tuple] = None):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
         from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
@@ -834,23 +1250,16 @@ class Sm107BlockScaledSymmBuffer:
         }
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
-        if cfg.kernel_variant != "genphase" and cfg.schedule_policy[0] == "phase_interleave":
-            # Multi-die GPU: the weight preprocessing places the lower half of the local experts on locality
-            # domain 0 and the upper half on domain 1 (die_local.py); the scheduler then lets each die claim
-            # from its own end of the expert-ordered work streams.
-            # Per-shape: at large expected rows per local expert (deep prefill) the work streams are long and
-            # the weight reads amortize; there the two-ended claim measured slower (EP16 T8192, 2340 rows: +3.9%),
-            # so it is used only up to _DIE_SPLIT_MAX_ROWS_PER_EXPERT.
-            from .die_local import locality_domain_count
-
-            rows_per_expert = (
-                cfg.max_tokens_per_rank * cfg.world_size * cfg.num_topk / cfg.num_total_experts
-            )
-            if (
-                locality_domain_count(torch.cuda.current_device()) >= 2
-                and rows_per_expert <= _DIE_SPLIT_MAX_ROWS_PER_EXPERT
-            ):
-                impl_fields["die_split"] = True
+        if data_layout is not None:
+            impl_fields["workspace_data_layout"] = data_layout
+        # Multi-die GPU: the weight preprocessing places the lower half of the local experts on locality
+        # domain 0 and the upper half on domain 1 (die_local.py); the scheduler then lets each die claim
+        # from its own end of the expert-ordered work streams.
+        # Per-shape: at large expected rows per local expert (deep prefill) the work streams are long and
+        # the weight reads amortize; there the two-ended claim measured slower (EP16 T8192, 2340 rows: +3.9%),
+        # so it is used only up to _DIE_SPLIT_MAX_ROWS_PER_EXPERT (_die_split_policy).
+        if _die_split_policy(cfg):
+            impl_fields["die_split"] = True
         if cfg.fallback_cluster_shape_mn is not None:
             impl_fields["fallback_cluster_shape_mn"] = tuple(
                 cfg.fallback_cluster_shape_mn
@@ -884,6 +1293,9 @@ class Sm107BlockScaledSymmBuffer:
         self._bound_scalars = bound
 
     def _scalar_tensor(self, name: str):
+        if self._variant_root is not None:
+            # Variants run with their workspace's bound or stored scalars.
+            return self._variant_root._scalar_tensor(name)
         bound = getattr(self, "_bound_scalars", None) or {}
         value = bound.get(name)
         return value if value is not None else getattr(self, name)
@@ -905,30 +1317,30 @@ class Sm107BlockScaledSymmBuffer:
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
         output: Optional[torch.Tensor] = None,
+        live_tokens: Optional[int] = None,
     ) -> dict:
         """Bind weights, workspaces, scalars, and output on the current stream.
 
         Output defaults to the workspace buffer. Its dynamic row extent lets
         one compiled kernel serve caller outputs with different live lengths.
+        The routing tensor is bound at its ``live_tokens`` rows (default: the
+        capacity): its runtime row extent is the router's live row count.
         """
         stream = torch.cuda.current_stream()
-        if output is None:
-            output = self.output_activation
-        # Separate reduction can write only the live rows, directly into the
-        # caller's output. Keep the row extent dynamic so warmed kernels also
-        # accept another batch size during CUDA graph capture.
-        output_cute = _to_cute(output, dynamic_leading=False)
-        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        own = self.__dict__  # this kernel's own staging views, whatever variant is selected
+        topk_idx = own["_own_topk_idx"]
+        if live_tokens is not None:
+            topk_idx = topk_idx[: max(int(live_tokens), 1)]
         return {
-            "activation": _to_cute(self.x),
-            "activation_sf": _to_cute(self.x_sf),
-            "topk_indices": _to_cute(self.topk_idx),
-            "topk_scores": _to_cute(self.topk_weights, assumed_align=4),
+            "activation": _to_cute(own["_own_x"]),
+            "activation_sf": _to_cute(own["_own_x_sf"]),
+            "topk_indices": _to_cute(topk_idx),
+            "topk_scores": _to_cute(own["_own_topk_weights"], assumed_align=4),
             "fc1_weight": _to_cute(transformed_l1[0]),
             "fc1_weight_sf": _to_cute(transformed_l1[1]),
             "fc2_weight": _to_cute(transformed_l2[0]),
             "fc2_weight_sf": _to_cute(transformed_l2[1]),
-            "output_activation": output_cute,
+            "output_activation": self._output_kwarg(output),
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
@@ -945,6 +1357,17 @@ class Sm107BlockScaledSymmBuffer:
             ),
         }
 
+    def _output_kwarg(self, output: Optional[torch.Tensor]):
+        """Output binding (default: the workspace buffer)."""
+        if output is None:
+            output = self.__dict__["_own_output_activation"]
+        # Separate reduction can write only the live rows, directly into the
+        # caller's output. Keep the row extent dynamic so warmed kernels also
+        # accept another batch size during CUDA graph capture.
+        output_cute = _to_cute(output, dynamic_leading=False)
+        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        return output_cute
+
     def _sm_locality_domain(self) -> torch.Tensor:
         """Die of every SM (``die_local.sm_locality_domain_map``), for the die_split scheduler."""
         from .die_local import SM_LOCALITY_MAP_SIZE, sm_locality_domain_map
@@ -954,17 +1377,41 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError("unexpected SM locality map size")
         return domains
 
+    def _live_tokens(self) -> Optional[int]:
+        root = self._variant_root or self
+        return getattr(root, "_staged_tokens", None)
+
     def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
         *,
         output: Optional[torch.Tensor] = None,
+        live_tokens: Optional[int] = None,
     ) -> None:
-        """Compile and bind the selected kernel without launching it."""
+        """Compile and bind the selected kernel without launching it.
+
+        ``live_tokens`` defaults to the staged token count. Variants compile
+        only through :meth:`prepare_batch_sizes`.
+        """
+        (self._active or self)._prepare_self(
+            transformed_l1,
+            transformed_l2,
+            output=output,
+            live_tokens=self._live_tokens() if live_tokens is None else live_tokens,
+        )
+
+    def _prepare_self(
+        self,
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+        *,
+        output: Optional[torch.Tensor] = None,
+        live_tokens: Optional[int] = None,
+    ) -> None:
         import cutlass.cute as cute
 
-        if self._destroyed:
+        if self._destroyed or (self._variant_root is not None and self._variant_root._destroyed):
             raise RuntimeError("cannot launch a destroyed SM107 workspace.")
         if output is not None and (
             self.config.reduce_topk_in_kernel
@@ -987,8 +1434,15 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError(
                 "SM107 workspace must launch on the CUDA device that owns it."
             )
+        if live_tokens is not None:
+            live_tokens = int(live_tokens)
+            if not 0 <= live_tokens <= self.config.max_tokens_per_rank:
+                raise ValueError(
+                    f"{live_tokens} live tokens exceed the kernel capacity "
+                    f"{self.config.max_tokens_per_rank}"
+                )
         self._validate_batch_invariant_scalars()
-        key = (
+        binding = (
             self.batch_invariant_fingerprint,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
@@ -1001,21 +1455,36 @@ class Sm107BlockScaledSymmBuffer:
                 for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             ),
+            torch.cuda.current_stream().cuda_stream,
+            live_tokens,
+        )
+        key = binding + (
             None
             if output is None
             else (output.data_ptr(), output.shape, output.stride()),
-            torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
             if self._compiled is None:
                 comm.ensure_not_capturing("SM107 mega kernel compile")
-            # DLPack metadata binding and stream conversion are host-only.
-            # A warmed workspace may bind another layer or stream in capture.
-            kwargs = (
-                self._runtime_kwargs(transformed_l1, transformed_l2)
-                if output is None
-                else self._runtime_kwargs(transformed_l1, transformed_l2, output)
-            )
+            # DLPack metadata binding and stream conversion are host-only. The
+            # bindings of the workspace's own buffers are cached per (live row
+            # count, layer weights, scalars, stream); a caller output is bound
+            # per key change and never cached, so at most the latest one
+            # (_launch_output) stays referenced. Cleared whenever the bound
+            # workspaces are released or rebound (_bind_execution_state).
+            cache = self.__dict__.setdefault("_kwargs_cache", {})
+            entry = cache.get(binding)
+            if entry is None:
+                entry = (
+                    self._runtime_kwargs(transformed_l1, transformed_l2, None, live_tokens),
+                    (transformed_l1, transformed_l2),
+                )
+                if len(cache) >= 64:
+                    cache.clear()
+                cache[binding] = entry
+            kwargs = entry[0]
+            if output is not None:
+                kwargs = {**kwargs, "output_activation": self._output_kwarg(output)}
             if self._compiled is None:
                 self._compiled = cute.compile(self.kernel, **kwargs)
             self._launch_key = key
@@ -1030,11 +1499,15 @@ class Sm107BlockScaledSymmBuffer:
         transformed_l2: TransformedBlockScaledWeights,
         *,
         output: Optional[torch.Tensor] = None,
+        live_tokens: Optional[int] = None,
     ) -> None:
         """Compile on first use, then launch the fused mega kernel."""
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             self._tuning_state.graph_captured = True
-        self.prepare(transformed_l1, transformed_l2, output=output)
+        self.prepare(transformed_l1, transformed_l2, output=output, live_tokens=live_tokens)
+        (self._active or self)._launch_prepared()
+
+    def _launch_prepared(self) -> None:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -1055,6 +1528,7 @@ class Sm107BlockScaledSymmBuffer:
 
     def _release_execution_state(self) -> None:
         """Drop cached tensor references and free owned symmetric buffers."""
+        self.__dict__.pop("_kwargs_cache", None)  # binds the buffers freed below
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None
@@ -1077,6 +1551,8 @@ class Sm107BlockScaledSymmBuffer:
     ) -> None:
         """Replace output and scratch before capture, retaining staged inputs."""
         import dataclasses
+
+        self._active = None
 
         def prepare_replacement():
             comm.ensure_not_capturing("SM107 tuning winner installation")
@@ -1107,6 +1583,9 @@ class Sm107BlockScaledSymmBuffer:
         )
         if prepared is not None:
             config, kernel, local = prepared
+            # A tuned winner replaces the layout: tuned (automatic) workspaces own no variants.
+            self._variants = ()
+            self._variant_plan = None
             self._release_execution_state()
             self.config, self.kernel = config, kernel
             self._allocate_execution_state(prepared=local)
@@ -1124,6 +1603,13 @@ class Sm107BlockScaledSymmBuffer:
         comm.ensure_not_capturing("SM107 mega workspace free")
         # Symmetric free is collective and does not wait for in-flight kernels.
         torch.cuda.synchronize()
+        self._active = None
+        for variant in self._variants:  # views of this workspace: no allocation of their own
+            variant._compiled = variant._launch_kwargs = None
+            variant.__dict__.pop("_kwargs_cache", None)
+            variant._destroyed = True
+        self._variants = ()
+        self.__dict__.pop("_kwargs_cache", None)
         self._release_execution_state()
         self._routing_checks.clear()
         self._tuning_inputs = None
@@ -1351,12 +1837,14 @@ def sm107_block_scaled_mega_moe(
     ):
         # TopkReduce runs locally and needs no symmetric output allocation.
         # REDG still uses the workspace's registered symmetric destination.
-        symm_buffer.launch(transformed_l1, transformed_l2, output=y[:num_tokens])
+        symm_buffer.launch(
+            transformed_l1, transformed_l2, output=y[:num_tokens], live_tokens=num_tokens
+        )
         if sync:
             torch.cuda.synchronize()
         return None
 
-    symm_buffer.launch(transformed_l1, transformed_l2)
+    symm_buffer.launch(transformed_l1, transformed_l2, live_tokens=num_tokens)
     out = symm_buffer.output_activation[:num_tokens]
     if y is None:
         if sync:

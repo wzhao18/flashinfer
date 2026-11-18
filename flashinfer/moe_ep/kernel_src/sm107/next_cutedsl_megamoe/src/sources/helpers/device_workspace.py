@@ -99,6 +99,10 @@ class DeviceWorkspace:
         self._tail_parity_region: Optional[str] = None
         self._tail_copy_bytes: Dict[BufferSpace, int] = {"local": 0, "shared": 0}
         self._tail_parity = None
+        # Optional data placement (set_data_layout): per-space byte offset of the first data region, and data
+        # regions placed first with a reserved footprint.
+        self._data_start: Optional[Dict[BufferSpace, int]] = None
+        self._leading_data: Tuple[Tuple[str, int], ...] = ()
         self._finalized = False
 
     def __extract_mlir_values__(self) -> list:
@@ -156,6 +160,25 @@ class DeviceWorkspace:
             raise RuntimeError("enable_tail_parity() must precede finalize().")
         self._tail_parity_region = parity_region
 
+    def set_data_layout(
+        self, data_start: Tuple[int, int], leading_data: Tuple[Tuple[str, int], ...] = ()
+    ) -> None:
+        """Place the data regions behind a fixed offset, some of them first with a reserved footprint.
+
+        ``data_start`` = (local, shared) byte offset of the first ``data`` region; the reset prefix (tail-reset
+        copies and zero-on-first-allocate state) must fit below it. ``leading_data`` = ((region name, reserved
+        bytes), ...): these data regions come first, in this order, each occupying at least the reserved bytes.
+        Several kernels can then share one allocation: each owns a private reset prefix at its own base, while
+        their data regions start at one common address and the leading regions keep a common placement.
+        """
+        if self._finalized:
+            raise RuntimeError("set_data_layout() must precede finalize().")
+        local_start, shared_start = (int(v) for v in data_start)
+        if local_start < 0 or shared_start < 0 or local_start % 128 or shared_start % 128:
+            raise ValueError("data_start offsets must be non-negative multiples of 128 bytes.")
+        self._data_start = {"local": local_start, "shared": shared_start}
+        self._leading_data = tuple((str(name), int(nbytes)) for name, nbytes in leading_data)
+
     @property
     def tail_parity_enabled(self) -> bool:
         return self._tail_parity_region is not None
@@ -180,8 +203,26 @@ class DeviceWorkspace:
                 )
         for buffer_space in ("local", "shared"):
             ordered = sorted(self._registered[buffer_space], key=lambda region: _reset_order[region.reset])
+            leading = {name: (rank, nbytes) for rank, (name, nbytes) in enumerate(self._leading_data)}
+            state = [region for region in ordered if region.reset != "data"]
+            data = [region for region in ordered if region.reset == "data"]
+            data = sorted(
+                data, key=lambda region: leading[region.name][0] if region.name in leading else len(leading)
+            )
+            ordered = state + data
             cursor = 0
             for region_index, region in enumerate(ordered):
+                if (
+                    self._data_start is not None
+                    and region.reset == "data"
+                    and (region_index == 0 or ordered[region_index - 1].reset != "data")
+                ):
+                    if cursor > self._data_start[buffer_space]:
+                        raise ValueError(
+                            f"{buffer_space} reset prefix ({cursor} B) exceeds the data offset "
+                            f"{self._data_start[buffer_space]} B."
+                        )
+                    cursor = max(cursor, self._data_start[buffer_space])
                 stride = region.stride
                 if stride is None:
                     raise RuntimeError(f"Region {region.name!r} stride was not resolved.")
@@ -199,7 +240,7 @@ class DeviceWorkspace:
                 self._cosize[region.name] = cosize
                 self._nbytes[region.name] = nbytes
                 self._byte_alignment[region.name] = byte_alignment
-                cursor += nbytes
+                cursor += max(nbytes, leading[region.name][1]) if region.name in leading else nbytes
                 is_last_tail_reset_region = region.reset == "tail_reset" and (
                     region_index + 1 == len(ordered) or ordered[region_index + 1].reset != "tail_reset"
                 )

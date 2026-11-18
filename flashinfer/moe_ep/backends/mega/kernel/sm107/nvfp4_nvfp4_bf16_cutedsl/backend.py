@@ -6,6 +6,8 @@ CUDA and CuTe DSL imports are deferred until the backend is used.
 
 from __future__ import annotations
 
+import dataclasses
+
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -231,7 +233,18 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         return Sm107BlockScaledSymmBuffer(
             self._resolved_config(fleet_params),
             process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+            # Automatic workspaces tune on the actual batch size instead.
+            variants=self._kernel_config.knobs != "auto",
+            # Each batch-size variant runs the configuration this backend resolves for that capacity.
+            config_for_capacity=lambda tokens: self._resolved_config(
+                dataclasses.replace(fleet_params, max_tokens_per_rank=tokens, tuning_live_tokens=None)
+            ),
         )
+
+    def prepare_batch_sizes(self, workspace, transformed_weights, batch_sizes) -> dict:
+        """Compile the workspace's kernel of every batch size ahead of time (see
+        ``Sm107BlockScaledSymmBuffer.prepare_batch_sizes``)."""
+        return workspace.prepare_batch_sizes(batch_sizes, *transformed_weights)
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""
@@ -263,7 +276,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             validate_nvfp4_batch_invariant(k, selected, arch="sm_107")
             return selected
         if k.knobs is None:
-            return {}
+            # Default knobs: the per-shape policy (offline cache, else the built-in heuristic with the
+            # routing geometry), resolved for this capacity like knobs="cache".
+            return self._workspace_knobs(fleet_params)
         if isinstance(k.knobs, dict):
             unknown = set(k.knobs) - set(KNOB_KEYS)
             if unknown:
@@ -281,6 +296,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 quant_kind="nvfp4",
                 kernel_variant=k.kernel_variant,
                 combine_dtype=k.combine_dtype,
+                world_size=self.ep_world_size,
+                topk=k.top_k,
+                num_experts=fleet_params.num_experts,
             )
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
@@ -333,6 +351,12 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         """Stage NVFP4 inputs, fusing eligible route checks with quantization."""
         if self._kernel_config.knobs == "auto":
             workspace._tuning_inputs = (t, quantize_input)
+        # Live-token bucket of this step (before staging: buckets own their routes).
+        select_live_tokens = getattr(workspace, "select_live_tokens", None)
+        if select_live_tokens is not None:
+            select_live_tokens(
+                t.runtime_max_tokens_per_rank, int(t.hidden_states.shape[0])
+            )
         self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(
