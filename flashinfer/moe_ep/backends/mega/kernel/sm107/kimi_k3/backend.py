@@ -10,6 +10,7 @@ from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import TORCH_DIST
 from ......core.validation.common import MoEEpArchError, MoEEpConfigError
+from ......kernel_src.sm107.ep_sizes import sm107_ep_world_size_error
 from .config import Sm107_KimiK3_MegaMoeConfig
 
 if TYPE_CHECKING:
@@ -56,12 +57,13 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
         ):
             if type(value) is not int or value != expected:
                 raise MoEEpConfigError(f"Kimi K3 requires {name}={expected}")
-        if type(bootstrap.world_size) is not int or bootstrap.world_size not in (
-            1,
-            8,
-            16,
-        ):
-            raise MoEEpConfigError("Kimi K3 supports world_size 1, 8 or 16")
+        # EP 1, 4, 8, 16, 28 or 32: whole experts per rank, at most one decode-router lane per source rank,
+        # whole 4-GPU nodes (kernel_src/sm107/ep_sizes.py).
+        ep_error = sm107_ep_world_size_error(
+            fleet_params.num_experts, bootstrap.world_size, single_node_sizes=(1,)
+        )
+        if ep_error is not None:
+            raise MoEEpConfigError(f"Kimi K3: {ep_error}")
         if (
             type(fleet_params.max_tokens_per_rank) is not int
             or not 1 <= fleet_params.max_tokens_per_rank <= 65536

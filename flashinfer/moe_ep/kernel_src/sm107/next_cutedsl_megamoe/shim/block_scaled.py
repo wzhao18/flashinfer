@@ -34,6 +34,7 @@ import torch
 from flashinfer.moe_ep._compat import deprecated_aliases
 
 from . import comm
+from ...ep_sizes import sm107_ep_world_size_error
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 from .tuning_state import AutoTuningState
@@ -482,11 +483,9 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError("num_topk must not exceed num_total_experts.")
         if self.padded_tokens_per_rank * self.num_topk > 2097152:
             raise ValueError("SM107 routing supports at most 2097152 routes per rank.")
-        if self.num_total_experts % self.world_size != 0:
-            raise ValueError(
-                f"num_total_experts ({self.num_total_experts}) must divide evenly "
-                f"across world_size ({self.world_size})."
-            )
+        ep_error = sm107_ep_world_size_error(self.num_total_experts, self.world_size)
+        if ep_error is not None:
+            raise ValueError(ep_error)
         vec = self.sf_vec_size
         if self.hidden % (4 * vec) != 0:
             raise ValueError(
